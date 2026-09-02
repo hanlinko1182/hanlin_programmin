@@ -1,0 +1,71 @@
+// functions.hl — Demonstrates user-defined functions in hanlin
+// Run: hanlin examples/functions.hl
+
+// Simple addition function
+fn add(a, b) {
+    return a + b;
+}
+
+// Multiply two numbers
+fn multiply(a, b) {
+    return a * b;
+}
+
+// Compute the maximum of two numbers
+fn max(a, b) {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+// Compute the minimum of two numbers
+fn min(a, b) {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+// Compute integer power: base^exp (exp >= 0)
+fn power(base, exp) {
+    let result = 1;
+    let i = 0;
+    while (i < exp) {
+        result = result * base;
+        i = i + 1;
+    }
+    return result;
+}
+
+// Check if a number is even (returns 1 for even, 0 for odd)
+fn is_even(n) {
+    if (n % 2 == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+// Absolute value
+fn abs(n) {
+    if (n < 0) {
+        return -n;
+    }
+    return n;
+}
+
+// ── Run demos ─────────────────────────────────────────────────────────────
+print("=== Function Demo ===");
+print("add(3, 7)       =", add(3, 7));
+print("multiply(6, 7)  =", multiply(6, 7));
+print("max(15, 42)     =", max(15, 42));
+print("min(15, 42)     =", min(15, 42));
+print("power(2, 10)    =", power(2, 10));
+print("is_even(42)     =", is_even(42));
+print("is_even(7)      =", is_even(7));
+print("abs(-99)        =", abs(-99));
+print("abs(42)         =", abs(42));
+
+// Compose functions
+let result = add(power(2, 8), multiply(3, 4));
+print("2^8 + 3*4       =", result);

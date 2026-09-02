@@ -1,0 +1,73 @@
+// fibonacci.hl — Fibonacci sequence using recursion and iteration
+// Run: hanlin examples/fibonacci.hl
+
+// ── Recursive Fibonacci ────────────────────────────────────────────────────
+// Classic recursive definition: fib(n) = fib(n-1) + fib(n-2)
+fn fibonacci(n) {
+    if (n <= 1) {
+        return n;
+    }
+    return fibonacci(n - 1) + fibonacci(n - 2);
+}
+
+// ── Iterative Fibonacci (more efficient) ──────────────────────────────────
+// Uses a while loop instead of recursion — O(n) time, O(1) space.
+fn fib_iter(n) {
+    if (n <= 1) {
+        return n;
+    }
+    let prev = 0;
+    let curr = 1;
+    let i    = 2;
+    while (i <= n) {
+        let next = prev + curr;
+        prev = curr;
+        curr = next;
+        i    = i + 1;
+    }
+    return curr;
+}
+
+// ── Factorial (bonus: another classic recursive function) ─────────────────
+fn factorial(n) {
+    if (n <= 1) {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+
+// ── Sum of 1..n ───────────────────────────────────────────────────────────
+fn sum_to(n) {
+    let total = 0;
+    let i     = 1;
+    while (i <= n) {
+        total = total + i;
+        i     = i + 1;
+    }
+    return total;
+}
+
+// ── Main program ──────────────────────────────────────────────────────────
+print("=== Recursive Fibonacci (fib 0..10) ===");
+let k = 0;
+while (k <= 10) {
+    print("fib(", k, ") =", fibonacci(k));
+    k = k + 1;
+}
+
+print("=== Iterative Fibonacci (fib 0..15) ===");
+let j = 0;
+while (j <= 15) {
+    print("fib_iter(", j, ") =", fib_iter(j));
+    j = j + 1;
+}
+
+print("=== Factorials (1..10) ===");
+let m = 1;
+while (m <= 10) {
+    print(m, "! =", factorial(m));
+    m = m + 1;
+}
+
+print("=== Sum 1..100 ===");
+print("sum_to(100) =", sum_to(100));

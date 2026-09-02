@@ -1,0 +1,37 @@
+// =============================================================================
+//  arrays.hl — Array demonstration in the hanlin language (v0.2)
+// =============================================================================
+
+print("=== hanlin Array Demo ===");
+
+// 1. Creation and Printing
+let list = [1, 2, 3];
+print("Initial array:  ", list);
+print("Array length:   ", list.length);      // length as property
+print("Array length(): ", list.length());    // length as method
+
+// 2. Index Access & Modification
+print("Element at index 0:", list[0]);
+print("Element at index 1:", list[1]);
+
+list[1] = 99;
+print("After list[1] = 99:", list);
+
+// 3. Dynamic Push Operations
+list.push(4);
+list.push(5);
+print("After pushing 4 and 5:", list);
+print("New length:           ", list.length);
+
+// 4. Strings are also indexable and have length
+let message = "hello";
+print("String:           ", message);
+print("String length:    ", message.length);
+print("Char at index 1:  ", message[1]);
+print("Char at index 4:  ", message[4]);
+
+// 5. Nested Arrays (Multi-dimensional)
+let matrix = [[1, 2], [3, 4], [5, 6]];
+print("Matrix:           ", matrix);
+print("Matrix[1]:        ", matrix[1]);
+print("Matrix[1][0]:     ", matrix[1][0]);

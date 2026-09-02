@@ -1,0 +1,72 @@
+name: Hanlin CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hanlin-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Format, lint, test, and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies and build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run all tests
+        run: cargo test --all-targets --all-features
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Verify CLI debug modes
+        run: |
+          ./target/release/hanlin examples/hello.hl --emit-tokens
+          ./target/release/hanlin examples/hello.hl --emit-ast
+          ./target/release/hanlin examples/hello.hl --emit-c > /tmp/hello.c
+          test -s /tmp/hello.c
+
+      - name: Verify generated C compiles
+        run: |
+          gcc /tmp/hello.c -o /tmp/hanlin-hello -lm
+          /tmp/hanlin-hello
+
+  security:
+    name: Dependency and repository hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check for known dependency vulnerabilities
+        uses: actions-rust-lang/audit@v1
+        continue-on-error: true
+
+      - name: Check whitespace errors
+        run: git diff --check

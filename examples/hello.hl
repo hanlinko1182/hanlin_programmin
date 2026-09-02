@@ -1,0 +1,5 @@
+// hello.hl — The classic first program in hanlin
+// Run: hanlin examples/hello.hl
+
+print("Hello, World!");
+print("Welcome to the hanlin programming language!");

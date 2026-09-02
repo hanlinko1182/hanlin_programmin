@@ -1,0 +1,41 @@
+name: Hanlin Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies and build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package Linux binary
+        run: |
+          mkdir -p dist
+          cp target/release/hanlin dist/hanlin-linux-x86_64
+          tar -czf dist/hanlin-${GITHUB_REF_NAME}-linux-x86_64.tar.gz -C dist hanlin-linux-x86_64
+          sha256sum dist/hanlin-${GITHUB_REF_NAME}-linux-x86_64.tar.gz > dist/SHA256SUMS
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/hanlin-${{ github.ref_name }}-linux-x86_64.tar.gz
+            dist/SHA256SUMS

@@ -1,0 +1,61 @@
+// arithmetic.hl — Basic arithmetic and variable operations in hanlin
+// Run: hanlin examples/arithmetic.hl
+
+// Integer arithmetic
+let a = 10;
+let b = 3;
+
+print("=== hanlin Arithmetic Demo ===");
+print("a =", a);
+print("b =", b);
+
+// Basic operations
+let sum        = a + b;
+let difference = a - b;
+let product    = a * b;
+let quotient   = a / b;
+let remainder  = a % b;
+
+print("a + b =", sum);
+print("a - b =", difference);
+print("a * b =", product);
+print("a / b =", quotient);
+print("a % b =", remainder);
+
+// Operator precedence — multiplication before addition
+let precedence = 2 + 3 * 4;
+print("2 + 3 * 4 =", precedence);
+
+// Grouped expression
+let grouped = (2 + 3) * 4;
+print("(2 + 3) * 4 =", grouped);
+
+// Float arithmetic
+let pi     = 3.14159;
+let radius = 5.0;
+let area   = pi * radius * radius;
+
+print("=== Circle Area ===");
+print("radius =", radius);
+print("area   =", area);
+
+// Counting with a while loop
+print("=== Counting from 1 to 5 ===");
+let i = 1;
+while (i <= 5) {
+    print(i);
+    i = i + 1;
+}
+
+// Conditional logic
+let x = 42;
+print("=== Conditionals ===");
+if (x > 100) {
+    print("x is greater than 100");
+} else {
+    if (x > 10) {
+        print("x is greater than 10");
+    } else {
+        print("x is 10 or less");
+    }
+}

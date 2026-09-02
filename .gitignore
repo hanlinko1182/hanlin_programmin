@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+
+# Generated C binaries / native objects
+*.o
+*.out
+*.exe
+a.out
+
+# Editor / IDE configs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,21 @@
+[package]
+name        = "hanlin"
+version     = "0.2.1"
+edition     = "2021"
+authors     = ["hanlin Language Project"]
+description = "Compiler for the hanlin programming language (.hl files)"
+keywords    = ["compiler", "language", "hanlin"]
+license     = "MIT"
+
+[[bin]]
+name = "hanlin"
+path = "src/main.rs"
+
+[dependencies]
+# No external dependencies — pure Rust stdlib implementation.
+# Future: add `inkwell` for LLVM bindings or `cranelift` for native codegen.
+
+[profile.release]
+opt-level = 3
+lto       = true
+strip     = true

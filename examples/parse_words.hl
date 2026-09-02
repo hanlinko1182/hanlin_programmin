@@ -1,0 +1,54 @@
+// =============================================================================
+//  parse_words.hl — Wordlist parser demo for hanlin v0.2.1
+//
+//  Demonstrates:
+//    - fs.readFile()  — File I/O from the hanlin standard library
+//    - .trim()        — Strip leading/trailing whitespace from a string
+//    - .split("\n")   — Tokenize a string into an array of lines
+//    - try-catch      — Graceful error handling when a file is missing
+// =============================================================================
+
+print("=== hanlin Wordlist Parser Demo ===");
+
+// ── Attempt 1: file that doesn't exist ──────────────────────────────────────
+print("\n[1] Reading a missing file (should be caught):");
+try {
+    let content = fs.readFile("nonexistent_wordlist.txt");
+    print("File contents:", content);
+} catch (err) {
+    print("Caught error:", err);
+}
+
+// ── Attempt 2: read a real file and process it line-by-line ─────────────────
+print("\n[2] Reading examples/words.txt (will create it first):");
+
+// We create a short word list programmatically using the words.txt file
+// that will be placed in examples/ by this script via the shell beforehand.
+try {
+    let raw     = fs.readFile("examples/words.txt");
+    let trimmed = raw.trim();
+    let words   = trimmed.split("\n");
+
+    print("Total words:", words.length);
+
+    // Print each word with its 1-based index
+    let i = 0;
+    while (i < words.length) {
+        let word = words[i].trim();
+        print(i + 1, "->", word);
+        i = i + 1;
+    }
+} catch (err) {
+    print("Could not read words.txt:", err);
+}
+
+// ── Attempt 3: inline string splitting ──────────────────────────────────────
+print("\n[3] Inline CSV split:");
+let csv = "apple,banana,cherry,date";
+let fruits = csv.split(",");
+print("Fruits count:", fruits.length);
+let f = 0;
+while (f < fruits.length) {
+    print(" -", fruits[f]);
+    f = f + 1;
+}

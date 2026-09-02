@@ -1,0 +1,34 @@
+// =============================================================================
+//  objects.hl — Object/Map demonstration in the hanlin language (v0.2)
+// =============================================================================
+
+print("=== hanlin Object Demo ===");
+
+// 1. Creation and Printing
+let user = { name: "Han", age: 20, developer: true };
+print("Initial user object: ", user);
+
+// 2. Member Access (Dot vs Bracket Notation)
+print("Accessing name via dot notation:   ", user.name);
+print("Accessing age via bracket notation:", user["age"]);
+
+// 3. Modifying Properties
+user.age = 21;
+user["name"] = "Han Lin";
+print("After updating name and age:        ", user);
+
+// 4. Adding New Properties Dynamically
+user.role = "Systems Developer";
+print("After adding new property 'role':    ", user);
+
+// 5. Nested Objects
+let employee = {
+    id: 101,
+    profile: {
+        firstName: "Jane",
+        lastName: "Doe"
+    }
+};
+print("Employee profile:                   ", employee.profile);
+print("Employee profile.firstName:          ", employee.profile.firstName);
+print("Employee profile[\"lastName\"]:        ", employee.profile["lastName"]);
