@@ -1,26 +1,54 @@
-//! Initial AST-to-bytecode compiler for Hanlin's stack VM.
+//! AST-to-bytecode compiler for Hanlin's stack VM.
 //!
-//! VM-09 deliberately compiles only primitive expressions and top-level
-//! globals. Supported expression nodes do not carry source spans in the
-//! current AST, so their containing statement's span is applied to every
-//! instruction they emit. An empty program uses [`EMPTY_PROGRAM_SPAN`] for
-//! its synthetic `Null` and `Return` instructions.
+//! The compiler supports primitive expressions, top-level globals, and the
+//! initial control-flow subset. Supported expression nodes do not carry source
+//! spans in the current AST, so their containing statement's span is applied
+//! to every instruction they emit. An empty program uses
+//! [`EMPTY_PROGRAM_SPAN`] for its synthetic `Null` and `Return` instructions.
 
 use std::fmt;
 
 use crate::ast::{BinOp, Expr, Literal, Program, Stmt, UnOp};
 use crate::error::Span;
 
-use super::{Chunk, ChunkError, OpCode, Value};
+use super::{Chunk, ChunkError, JumpOffset, OpCode, Value};
 
 const EMPTY_PROGRAM_SPAN: Span = Span { line: 1, col: 1 };
 
 /// A structured failure produced while lowering Hanlin AST into bytecode.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CompileError {
-    UnsupportedStatement { kind: &'static str, span: Span },
-    UnsupportedExpression { kind: &'static str, span: Span },
-    ConstantPool { error: ChunkError, span: Span },
+    UnsupportedStatement {
+        kind: &'static str,
+        span: Span,
+    },
+    UnsupportedExpression {
+        kind: &'static str,
+        span: Span,
+    },
+    ConstantPool {
+        error: ChunkError,
+        span: Span,
+    },
+    BreakOutsideLoop {
+        span: Span,
+    },
+    ContinueOutsideLoop {
+        span: Span,
+    },
+    JumpTooLarge {
+        distance: usize,
+        span: Span,
+    },
+    InvalidJumpPatch {
+        instruction_offset: usize,
+        target: usize,
+        span: Span,
+    },
+    ChunkPatch {
+        error: ChunkError,
+        span: Span,
+    },
 }
 
 impl fmt::Display for CompileError {
@@ -35,29 +63,72 @@ impl fmt::Display for CompileError {
             Self::ConstantPool { error, span } => {
                 write!(f, "constant-pool error at {span}: {error}")
             }
+            Self::BreakOutsideLoop { span } => write!(f, "break outside a loop at {span}"),
+            Self::ContinueOutsideLoop { span } => {
+                write!(f, "continue outside a loop at {span}")
+            }
+            Self::JumpTooLarge { distance, span } => write!(
+                f,
+                "jump distance {distance} exceeds the bytecode operand capacity at {span}"
+            ),
+            Self::InvalidJumpPatch {
+                instruction_offset,
+                target,
+                span,
+            } => write!(
+                f,
+                "cannot patch jump at instruction {instruction_offset} to target {target} at {span}"
+            ),
+            Self::ChunkPatch { error, span } => {
+                write!(f, "failed to patch bytecode at {span}: {error}")
+            }
         }
     }
 }
 
 impl std::error::Error for CompileError {}
 
-/// Compiles the VM-09 subset of Hanlin's existing AST into a [`Chunk`].
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Compiler;
+#[derive(Clone, Copy, Debug)]
+struct PendingJump {
+    instruction_offset: usize,
+    span: Span,
+}
+
+#[derive(Debug)]
+struct LoopContext {
+    loop_start: usize,
+    continue_target: usize,
+    break_jumps: Vec<PendingJump>,
+}
+
+/// Compiles the supported subset of Hanlin's existing AST into a [`Chunk`].
+#[derive(Debug, Default)]
+pub struct Compiler {
+    loop_contexts: Vec<LoopContext>,
+}
 
 impl Compiler {
     pub const fn new() -> Self {
-        Self
+        Self {
+            loop_contexts: Vec::new(),
+        }
     }
 
     /// Compiles a top-level program and always emits explicit termination.
     pub fn compile(&mut self, program: &Program) -> Result<Chunk, CompileError> {
+        self.loop_contexts.clear();
+        let result = self.compile_program(program);
+        self.loop_contexts.clear();
+        result
+    }
+
+    fn compile_program(&mut self, program: &Program) -> Result<Chunk, CompileError> {
         let mut chunk = Chunk::new();
         let mut termination_span = EMPTY_PROGRAM_SPAN;
 
         for statement in &program.body {
             termination_span = statement_span(statement);
-            Self::compile_statement(&mut chunk, statement)?;
+            self.compile_statement(&mut chunk, statement)?;
         }
 
         chunk.write_instruction(OpCode::Null, termination_span);
@@ -65,7 +136,11 @@ impl Compiler {
         Ok(chunk)
     }
 
-    fn compile_statement(chunk: &mut Chunk, statement: &Stmt) -> Result<(), CompileError> {
+    fn compile_statement(
+        &mut self,
+        chunk: &mut Chunk,
+        statement: &Stmt,
+    ) -> Result<(), CompileError> {
         match statement {
             Stmt::VarDecl {
                 name, init, span, ..
@@ -90,18 +165,186 @@ impl Compiler {
             Stmt::Return { span, .. } => {
                 Err(Self::unsupported_statement("return statement", *span))
             }
-            Stmt::If { span, .. } => Err(Self::unsupported_statement("if statement", *span)),
-            Stmt::While { span, .. } => Err(Self::unsupported_statement("while statement", *span)),
+            Stmt::If {
+                condition,
+                then_body,
+                else_body,
+                span,
+            } => self.compile_if(chunk, condition, then_body, else_body.as_deref(), *span),
+            Stmt::While {
+                condition,
+                body,
+                span,
+            } => self.compile_while(chunk, condition, body, *span),
             Stmt::For { span, .. } => Err(Self::unsupported_statement("for statement", *span)),
-            Stmt::Break { span } => Err(Self::unsupported_statement("break statement", *span)),
-            Stmt::Continue { span } => {
-                Err(Self::unsupported_statement("continue statement", *span))
-            }
+            Stmt::Break { span } => self.compile_break(chunk, *span),
+            Stmt::Continue { span } => self.compile_continue(chunk, *span),
             Stmt::TryCatch { span, .. } => {
                 Err(Self::unsupported_statement("try/catch statement", *span))
             }
             Stmt::Print { span, .. } => Err(Self::unsupported_statement("print statement", *span)),
         }
+    }
+
+    fn compile_if(
+        &mut self,
+        chunk: &mut Chunk,
+        condition: &Expr,
+        then_body: &[Stmt],
+        else_body: Option<&[Stmt]>,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        Self::compile_expression(chunk, condition, span)?;
+        let false_jump = Self::emit_jump(chunk, true, span);
+        chunk.write_instruction(OpCode::Pop, span);
+
+        self.compile_statements(chunk, then_body)?;
+        let end_jump = Self::emit_jump(chunk, false, span);
+
+        Self::patch_jump(chunk, false_jump, chunk.instructions().len(), span)?;
+        chunk.write_instruction(OpCode::Pop, span);
+        if let Some(else_body) = else_body {
+            self.compile_statements(chunk, else_body)?;
+        }
+
+        Self::patch_jump(chunk, end_jump, chunk.instructions().len(), span)
+    }
+
+    fn compile_while(
+        &mut self,
+        chunk: &mut Chunk,
+        condition: &Expr,
+        body: &[Stmt],
+        span: Span,
+    ) -> Result<(), CompileError> {
+        let loop_start = chunk.instructions().len();
+        Self::compile_expression(chunk, condition, span)?;
+        let exit_jump = Self::emit_jump(chunk, true, span);
+        chunk.write_instruction(OpCode::Pop, span);
+
+        self.loop_contexts.push(LoopContext {
+            loop_start,
+            continue_target: loop_start,
+            break_jumps: Vec::new(),
+        });
+        self.compile_statements(chunk, body)?;
+        Self::emit_loop(chunk, loop_start, span)?;
+
+        Self::patch_jump(chunk, exit_jump, chunk.instructions().len(), span)?;
+        chunk.write_instruction(OpCode::Pop, span);
+        let break_target = chunk.instructions().len();
+        let loop_context = self
+            .loop_contexts
+            .pop()
+            .ok_or(CompileError::InvalidJumpPatch {
+                instruction_offset: loop_start,
+                target: break_target,
+                span,
+            })?;
+        debug_assert_eq!(loop_context.loop_start, loop_start);
+        for pending in loop_context.break_jumps {
+            Self::patch_jump(
+                chunk,
+                pending.instruction_offset,
+                break_target,
+                pending.span,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn compile_break(&mut self, chunk: &mut Chunk, span: Span) -> Result<(), CompileError> {
+        let loop_context = self
+            .loop_contexts
+            .last_mut()
+            .ok_or(CompileError::BreakOutsideLoop { span })?;
+        let instruction_offset = Self::emit_jump(chunk, false, span);
+        loop_context.break_jumps.push(PendingJump {
+            instruction_offset,
+            span,
+        });
+        Ok(())
+    }
+
+    fn compile_continue(&mut self, chunk: &mut Chunk, span: Span) -> Result<(), CompileError> {
+        let continue_target = self
+            .loop_contexts
+            .last()
+            .ok_or(CompileError::ContinueOutsideLoop { span })?
+            .continue_target;
+        Self::emit_loop(chunk, continue_target, span)
+    }
+
+    fn compile_statements(
+        &mut self,
+        chunk: &mut Chunk,
+        statements: &[Stmt],
+    ) -> Result<(), CompileError> {
+        for statement in statements {
+            self.compile_statement(chunk, statement)?;
+        }
+        Ok(())
+    }
+
+    fn emit_jump(chunk: &mut Chunk, conditional: bool, span: Span) -> usize {
+        let offset = JumpOffset::new(0);
+        let opcode = if conditional {
+            OpCode::JumpIfFalse(offset)
+        } else {
+            OpCode::Jump(offset)
+        };
+        chunk.write_instruction(opcode, span)
+    }
+
+    fn patch_jump(
+        chunk: &mut Chunk,
+        instruction_offset: usize,
+        target: usize,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        let post_fetch =
+            instruction_offset
+                .checked_add(1)
+                .ok_or(CompileError::InvalidJumpPatch {
+                    instruction_offset,
+                    target,
+                    span,
+                })?;
+        let distance = target
+            .checked_sub(post_fetch)
+            .ok_or(CompileError::InvalidJumpPatch {
+                instruction_offset,
+                target,
+                span,
+            })?;
+        let offset = JumpOffset::try_from(distance)
+            .map_err(|_| CompileError::JumpTooLarge { distance, span })?;
+        chunk
+            .patch_jump(instruction_offset, offset)
+            .map_err(|error| CompileError::ChunkPatch { error, span })
+    }
+
+    fn emit_loop(chunk: &mut Chunk, target: usize, span: Span) -> Result<(), CompileError> {
+        let instruction_offset = chunk.instructions().len();
+        let post_fetch =
+            instruction_offset
+                .checked_add(1)
+                .ok_or(CompileError::InvalidJumpPatch {
+                    instruction_offset,
+                    target,
+                    span,
+                })?;
+        let distance = post_fetch
+            .checked_sub(target)
+            .ok_or(CompileError::InvalidJumpPatch {
+                instruction_offset,
+                target,
+                span,
+            })?;
+        let offset = JumpOffset::try_from(distance)
+            .map_err(|_| CompileError::JumpTooLarge { distance, span })?;
+        chunk.write_instruction(OpCode::Loop(offset), span);
+        Ok(())
     }
 
     fn compile_expression(
@@ -244,7 +487,7 @@ mod tests {
     use crate::interpreter::{Env, Interpreter};
     use crate::lexer::Lexer;
     use crate::parser::Parser;
-    use crate::vm::{disassemble_chunk, Chunk, OpCode, Value, Vm};
+    use crate::vm::{disassemble_chunk, Chunk, JumpOffset, OpCode, Value, Vm};
 
     fn parse_source(source: &str) -> crate::ast::Program {
         let tokens = Lexer::new(source).tokenize().unwrap();
@@ -265,6 +508,10 @@ mod tests {
         let mut vm = Vm::new();
         assert_eq!(vm.run(&chunk), Ok(Value::Null));
 
+        read_global(&mut vm, name)
+    }
+
+    fn read_global(vm: &mut Vm, name: &str) -> Value {
         let mut read = Chunk::new();
         let name = read.add_constant(Value::String(name.to_owned())).unwrap();
         read.write_instruction(OpCode::GetGlobal(name), Span::new(1, 1));
@@ -568,19 +815,348 @@ mod tests {
     }
 
     #[test]
-    fn rejects_if_statement_with_span() {
+    fn if_true_executes_body() {
         assert_eq!(
-            compile_source("if (true) { let x = 1; }"),
-            Err(CompileError::UnsupportedStatement {
-                kind: "if statement",
+            run_source_and_get("let x = 0; if (true) { x = 1; }", "x"),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn if_false_skips_body() {
+        assert_eq!(
+            run_source_and_get("let x = 0; if (false) { x = 1; }", "x"),
+            Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn if_else_executes_true_branch() {
+        assert_eq!(
+            run_source_and_get("let x = 0; if (true) { x = 1; } else { x = 2; }", "x",),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn if_else_executes_false_branch() {
+        assert_eq!(
+            run_source_and_get("let x = 0; if (false) { x = 1; } else { x = 2; }", "x",),
+            Value::Int(2)
+        );
+    }
+
+    #[test]
+    fn compiles_nested_if() {
+        assert_eq!(
+            run_source_and_get("let x = 0; if (true) { if (true) { x = 3; } }", "x",),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn compiles_nested_if_else() {
+        let source = concat!(
+            "let x = 0; ",
+            "if (true) { ",
+            "  if (false) { x = 1; } else { x = 2; } ",
+            "} else { x = 3; }"
+        );
+
+        assert_eq!(run_source_and_get(source, "x"), Value::Int(2));
+    }
+
+    #[test]
+    fn if_condition_is_cleaned_on_both_paths() {
+        for condition in ["true", "false"] {
+            let source =
+                format!("let x = 0; if ({condition}) {{ 1 + 2; }} else {{ 3 + 4; }} x = x + 1;");
+
+            assert_eq!(run_source_and_get(&source, "x"), Value::Int(1));
+        }
+    }
+
+    #[test]
+    fn while_executes_repeatedly() {
+        assert_eq!(
+            run_source_and_get("let x = 0; while (x < 3) { x = x + 1; }", "x",),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn while_false_executes_zero_times() {
+        assert_eq!(
+            run_source_and_get("let x = 0; while (false) { x = 1; }", "x"),
+            Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn while_updates_global_state() {
+        let source = concat!(
+            "let x = 0; let sum = 0; ",
+            "while (x < 4) { sum = sum + x; x = x + 1; }"
+        );
+
+        assert_eq!(run_source_and_get(source, "sum"), Value::Int(6));
+    }
+
+    #[test]
+    fn while_exits_at_false_condition() {
+        let source = "let x = 0; while (x < 2) { x = x + 1; } let done = x == 2;";
+
+        assert_eq!(run_source_and_get(source, "done"), Value::Bool(true));
+    }
+
+    #[test]
+    fn while_condition_is_cleaned_after_exit() {
+        let source = "let x = 0; while (x < 2) { x = x + 1; } x = x + 40;";
+
+        assert_eq!(run_source_and_get(source, "x"), Value::Int(42));
+    }
+
+    #[test]
+    fn break_exits_while() {
+        let source = "let x = 0; while (true) { x = x + 1; break; }";
+
+        assert_eq!(run_source_and_get(source, "x"), Value::Int(1));
+    }
+
+    #[test]
+    fn break_inside_conditional_exits_while() {
+        let source = concat!(
+            "let x = 0; ",
+            "while (x < 5) { x = x + 1; if (x == 2) { break; } }"
+        );
+
+        assert_eq!(run_source_and_get(source, "x"), Value::Int(2));
+    }
+
+    #[test]
+    fn break_targets_nearest_nested_loop() {
+        let source = concat!(
+            "let outer = 0; let inner = 0; let hits = 0; ",
+            "while (outer < 2) { ",
+            "  outer = outer + 1; inner = 0; ",
+            "  while (inner < 3) { inner = inner + 1; break; } ",
+            "  hits = hits + 1; ",
+            "}"
+        );
+
+        assert_eq!(run_source_and_get(source, "outer"), Value::Int(2));
+        assert_eq!(run_source_and_get(source, "hits"), Value::Int(2));
+    }
+
+    #[test]
+    fn break_outside_loop_is_compile_error() {
+        assert_eq!(
+            compile_source("break;"),
+            Err(CompileError::BreakOutsideLoop {
                 span: Span::new(1, 1),
             })
         );
     }
 
     #[test]
-    fn rejects_while_statement() {
-        assert_unsupported_statement("while (true) { break; }", "while statement");
+    fn continue_restarts_while_condition() {
+        let source = concat!(
+            "let x = 0; let skipped = 0; ",
+            "while (x < 3) { x = x + 1; continue; skipped = skipped + 1; }"
+        );
+
+        assert_eq!(run_source_and_get(source, "x"), Value::Int(3));
+        assert_eq!(run_source_and_get(source, "skipped"), Value::Int(0));
+    }
+
+    #[test]
+    fn continue_inside_conditional_restarts_while() {
+        let source = concat!(
+            "let x = 0; let hits = 0; ",
+            "while (x < 3) { ",
+            "  x = x + 1; if (x < 3) { continue; } hits = hits + 1; ",
+            "}"
+        );
+
+        assert_eq!(run_source_and_get(source, "hits"), Value::Int(1));
+    }
+
+    #[test]
+    fn continue_targets_nearest_nested_loop() {
+        let source = concat!(
+            "let outer = 0; let inner = 0; let hits = 0; ",
+            "while (outer < 2) { ",
+            "  outer = outer + 1; inner = 0; ",
+            "  while (inner < 2) { inner = inner + 1; continue; } ",
+            "  hits = hits + 1; ",
+            "}"
+        );
+
+        assert_eq!(run_source_and_get(source, "outer"), Value::Int(2));
+        assert_eq!(run_source_and_get(source, "hits"), Value::Int(2));
+    }
+
+    #[test]
+    fn continue_outside_loop_is_compile_error() {
+        assert_eq!(
+            compile_source("continue;"),
+            Err(CompileError::ContinueOutsideLoop {
+                span: Span::new(1, 1),
+            })
+        );
+    }
+
+    #[test]
+    fn compiler_patches_forward_branch_targets() {
+        let chunk = compile_source("if (true) { 1; }").unwrap();
+        let output = disassemble_chunk(&chunk, "if").unwrap();
+
+        assert!(output.contains("JUMP_IF_FALSE    4 -> 6"));
+        assert!(output.contains("JUMP             1 -> 7"));
+    }
+
+    #[test]
+    fn multiple_break_sites_patch_to_same_loop_exit() {
+        let source = concat!(
+            "let x = 0;\n",
+            "while (x < 5) {\n",
+            "  if (x == 1) {\n",
+            "    break;\n",
+            "  }\n",
+            "  if (x == 2) {\n",
+            "    break;\n",
+            "  }\n",
+            "  x = x + 1;\n",
+            "}"
+        );
+        let chunk = compile_source(source).unwrap();
+        let break_targets: Vec<_> = chunk
+            .instructions()
+            .iter()
+            .enumerate()
+            .filter_map(|(instruction_offset, instruction)| {
+                if !matches!(instruction.span().line, 4 | 7) {
+                    return None;
+                }
+                match instruction.opcode() {
+                    OpCode::Jump(offset) => Some(instruction_offset + 1 + offset.as_usize()),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        assert_eq!(break_targets.len(), 2);
+        assert_eq!(break_targets[0], break_targets[1]);
+        assert_eq!(run_source_and_get(source, "x"), Value::Int(1));
+    }
+
+    #[test]
+    fn nested_branch_patching_does_not_interfere() {
+        let source = concat!(
+            "let result = 0; ",
+            "if (true) { ",
+            "  if (false) { result = 1; } else { result = 2; } ",
+            "} else { result = 3; }"
+        );
+
+        let chunk = compile_source(source).unwrap();
+        assert!(disassemble_chunk(&chunk, "nested").is_ok());
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(2));
+    }
+
+    #[test]
+    fn oversized_jump_distance_is_compile_error() {
+        let span = Span::new(9, 4);
+        let mut chunk = Chunk::new();
+        let instruction_offset = Compiler::emit_jump(&mut chunk, false, span);
+        let distance = usize::from(u16::MAX) + 1;
+        let target = instruction_offset + 1 + distance;
+
+        assert_eq!(
+            Compiler::patch_jump(&mut chunk, instruction_offset, target, span),
+            Err(CompileError::JumpTooLarge { distance, span })
+        );
+        assert_eq!(
+            chunk.instruction(instruction_offset).unwrap().opcode(),
+            OpCode::Jump(JumpOffset::new(0))
+        );
+    }
+
+    #[test]
+    fn vm_stack_behavior_remains_balanced_after_if() {
+        let source = concat!(
+            "let x = 0; ",
+            "if (false) { 1 + 2; } else { 3 + 4; } ",
+            "x = x + 1;"
+        );
+
+        assert_eq!(run_source_and_get(source, "x"), Value::Int(1));
+        assert_eq!(run_source(source), Value::Null);
+    }
+
+    #[test]
+    fn vm_stack_behavior_remains_balanced_after_while() {
+        let source = "let x = 0; while (x < 3) { x = x + 1; } 40 + 2;";
+
+        assert_eq!(run_source_and_get(source, "x"), Value::Int(3));
+        assert_eq!(run_source(source), Value::Null);
+    }
+
+    #[test]
+    fn vm_is_reusable_after_compiled_control_flow() {
+        let first = compile_source("let x = 0; while (x < 2) { x = x + 1; }").unwrap();
+        let second = compile_source("let y = 0; if (true) { y = 7; }").unwrap();
+        let mut vm = Vm::new();
+
+        assert_eq!(vm.run(&first), Ok(Value::Null));
+        assert_eq!(vm.run(&second), Ok(Value::Null));
+        assert_eq!(read_global(&mut vm, "x"), Value::Int(2));
+        assert_eq!(read_global(&mut vm, "y"), Value::Int(7));
+    }
+
+    #[test]
+    fn control_flow_instructions_preserve_statement_spans() {
+        let source = concat!(
+            "if (true) { 1; }\n",
+            "while (false) {\n",
+            "  break;\n",
+            "  continue;\n",
+            "}"
+        );
+        let chunk = compile_source(source).unwrap();
+
+        assert!(chunk.instructions().iter().any(|instruction| {
+            matches!(instruction.opcode(), OpCode::JumpIfFalse(_))
+                && instruction.span() == Span::new(1, 1)
+        }));
+        assert!(chunk.instructions().iter().any(|instruction| {
+            matches!(
+                instruction.opcode(),
+                OpCode::JumpIfFalse(_) | OpCode::Loop(_)
+            ) && instruction.span() == Span::new(2, 1)
+        }));
+        assert!(chunk.instructions().iter().any(|instruction| {
+            matches!(instruction.opcode(), OpCode::Jump(_)) && instruction.span() == Span::new(3, 3)
+        }));
+        assert!(chunk.instructions().iter().any(|instruction| {
+            matches!(instruction.opcode(), OpCode::Loop(_)) && instruction.span() == Span::new(4, 3)
+        }));
+    }
+
+    #[test]
+    fn rejects_source_return_statement_with_span() {
+        assert_eq!(
+            compile_source("return 1;"),
+            Err(CompileError::UnsupportedStatement {
+                kind: "return statement",
+                span: Span::new(1, 1),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_for_statement() {
+        assert_unsupported_statement("for (;;) { break; }", "for statement");
     }
 
     #[test]
@@ -668,6 +1244,26 @@ mod tests {
         assert_eq!(
             run_source_and_get(source, "result").to_string(),
             interpreter_global(source, "result")
+        );
+    }
+
+    #[test]
+    fn vm_matches_interpreter_for_if_global() {
+        let source = "let x = 0; if (true) { x = 10; }";
+
+        assert_eq!(
+            run_source_and_get(source, "x").to_string(),
+            interpreter_global(source, "x")
+        );
+    }
+
+    #[test]
+    fn vm_matches_interpreter_for_while_global() {
+        let source = "let x = 0; while (x < 3) { x = x + 1; }";
+
+        assert_eq!(
+            run_source_and_get(source, "x").to_string(),
+            interpreter_global(source, "x")
         );
     }
 }

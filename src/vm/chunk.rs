@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::error::Span;
 
-use super::opcode::{ConstantIndex, OpCode};
+use super::opcode::{ConstantIndex, JumpOffset, OpCode};
 use super::value::Value;
 
 /// A bytecode instruction paired with its originating Hanlin source location.
@@ -26,12 +26,31 @@ impl Instruction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChunkError {
     TooManyConstants,
+    InvalidInstructionOffset {
+        offset: usize,
+        instruction_count: usize,
+    },
+    NotJumpInstruction {
+        offset: usize,
+        opcode: OpCode,
+    },
 }
 
 impl fmt::Display for ChunkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TooManyConstants => write!(f, "bytecode constant pool exceeds u32 capacity"),
+            Self::InvalidInstructionOffset {
+                offset,
+                instruction_count,
+            } => write!(
+                f,
+                "instruction offset {offset} is out of bounds for a chunk with {instruction_count} instructions"
+            ),
+            Self::NotJumpInstruction { offset, opcode } => write!(
+                f,
+                "instruction {offset} cannot be patched as a jump because it is {opcode:?}"
+            ),
         }
     }
 }
@@ -71,6 +90,35 @@ impl Chunk {
         offset
     }
 
+    /// Replaces only the operand of an existing jump instruction.
+    ///
+    /// The instruction's opcode kind and source span are preserved. This is
+    /// intentionally narrower than exposing arbitrary mutable instructions.
+    pub fn patch_jump(
+        &mut self,
+        instruction_offset: usize,
+        jump_offset: JumpOffset,
+    ) -> Result<(), ChunkError> {
+        let instruction_count = self.instructions.len();
+        let instruction = self.instructions.get_mut(instruction_offset).ok_or(
+            ChunkError::InvalidInstructionOffset {
+                offset: instruction_offset,
+                instruction_count,
+            },
+        )?;
+
+        match &mut instruction.opcode {
+            OpCode::Jump(offset) | OpCode::JumpIfFalse(offset) | OpCode::Loop(offset) => {
+                *offset = jump_offset;
+                Ok(())
+            }
+            opcode => Err(ChunkError::NotJumpInstruction {
+                offset: instruction_offset,
+                opcode: *opcode,
+            }),
+        }
+    }
+
     pub fn instructions(&self) -> &[Instruction] {
         &self.instructions
     }
@@ -97,9 +145,9 @@ impl Default for Chunk {
 
 #[cfg(test)]
 mod tests {
-    use super::Chunk;
+    use super::{Chunk, ChunkError};
     use crate::error::Span;
-    use crate::vm::{OpCode, Value};
+    use crate::vm::{JumpOffset, OpCode, Value};
 
     #[test]
     fn new_chunk_is_empty() {
@@ -183,5 +231,47 @@ mod tests {
         let offset = chunk.write_instruction(OpCode::Return, span);
 
         assert_eq!(chunk.instruction(offset).unwrap().span(), span);
+    }
+
+    #[test]
+    fn patches_jump_operand_and_preserves_span() {
+        let mut chunk = Chunk::new();
+        let span = Span::new(8, 4);
+        let offset = chunk.write_instruction(OpCode::JumpIfFalse(JumpOffset::new(0)), span);
+
+        chunk.patch_jump(offset, JumpOffset::new(12)).unwrap();
+
+        assert_eq!(
+            chunk.instruction(offset).unwrap().opcode(),
+            OpCode::JumpIfFalse(JumpOffset::new(12))
+        );
+        assert_eq!(chunk.instruction(offset).unwrap().span(), span);
+    }
+
+    #[test]
+    fn patch_jump_rejects_invalid_instruction_offset() {
+        let mut chunk = Chunk::new();
+
+        assert_eq!(
+            chunk.patch_jump(3, JumpOffset::new(1)),
+            Err(ChunkError::InvalidInstructionOffset {
+                offset: 3,
+                instruction_count: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn patch_jump_rejects_non_jump_instruction() {
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(OpCode::Null, Span::new(1, 1));
+
+        assert_eq!(
+            chunk.patch_jump(0, JumpOffset::new(1)),
+            Err(ChunkError::NotJumpInstruction {
+                offset: 0,
+                opcode: OpCode::Null,
+            })
+        );
     }
 }
