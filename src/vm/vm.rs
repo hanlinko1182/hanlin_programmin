@@ -1,7 +1,7 @@
 //! Execution engine for Hanlin bytecode.
 //!
-//! The VM executes manually constructed foundational bytecode. Compilation
-//! and higher-level runtime behavior remain separate future work.
+//! The VM executes manually constructed bytecode and chunks produced by the
+//! initial AST compiler. Higher-level runtime behavior remains future work.
 //! Integer arithmetic is checked and reports [`VmError::IntegerOverflow`]
 //! instead of depending on Rust's debug or release overflow behavior.
 
