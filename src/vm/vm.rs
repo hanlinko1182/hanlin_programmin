@@ -1,18 +1,22 @@
 //! Execution engine for Hanlin bytecode.
 //!
 //! The VM executes manually constructed bytecode and chunks produced by the
-//! initial AST compiler. Higher-level runtime behavior remains future work.
+//! AST compiler, including named functions through iterative call frames.
 //! Integer arithmetic is checked and reports [`VmError::IntegerOverflow`]
 //! instead of depending on Rust's debug or release overflow behavior.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
 use crate::error::Span;
 
 use super::opcode::{resolve_jump_target, JumpDirection};
-use super::{Chunk, JumpOffset, LocalSlot, OpCode, Value};
+use super::{Arity, Chunk, Function, JumpOffset, LocalSlot, OpCode, Value};
+
+/// Maximum number of active Hanlin function calls, excluding the script frame.
+pub const MAX_CALL_FRAMES: usize = 1024;
 
 /// A structured failure encountered while executing Hanlin bytecode.
 #[derive(Clone, Debug, PartialEq)]
@@ -82,6 +86,23 @@ pub enum VmError {
     UndefinedGlobal {
         instruction_offset: usize,
         name: String,
+        span: Span,
+    },
+    NotCallable {
+        instruction_offset: usize,
+        value: Value,
+        span: Span,
+    },
+    ArityMismatch {
+        instruction_offset: usize,
+        function: String,
+        expected: Arity,
+        got: Arity,
+        span: Span,
+    },
+    CallStackOverflow {
+        instruction_offset: usize,
+        limit: usize,
         span: Span,
     },
 }
@@ -215,6 +236,34 @@ impl fmt::Display for VmError {
                 f,
                 "undefined global '{name}' at instruction {instruction_offset} ({span})"
             ),
+            Self::NotCallable {
+                instruction_offset,
+                value,
+                span,
+            } => write!(
+                f,
+                "value {value:?} is not callable at instruction {instruction_offset} ({span})"
+            ),
+            Self::ArityMismatch {
+                instruction_offset,
+                function,
+                expected,
+                got,
+                span,
+            } => write!(
+                f,
+                "function '{function}' expects {} arguments, but got {} at instruction {instruction_offset} ({span})",
+                expected.as_u8(),
+                got.as_u8()
+            ),
+            Self::CallStackOverflow {
+                instruction_offset,
+                limit,
+                span,
+            } => write!(
+                f,
+                "call stack limit {limit} exceeded at instruction {instruction_offset} ({span})"
+            ),
         }
     }
 }
@@ -224,20 +273,28 @@ impl std::error::Error for VmError {}
 /// The basic stack virtual machine for Hanlin bytecode.
 ///
 /// The operand stack is private and belongs to one execution. Both it and the
-/// instruction pointer are reset before and after every [`run`](Self::run).
+/// call-frame stack are reset before and after every [`run`](Self::run).
 /// Global bindings are intentionally retained across runs for future REPL use.
 #[derive(Debug)]
 pub struct Vm {
     stack: Vec<Value>,
-    instruction_pointer: usize,
+    frames: Vec<CallFrame>,
     globals: HashMap<String, Value>,
+}
+
+#[derive(Debug)]
+struct CallFrame {
+    function: Rc<Function>,
+    instruction_pointer: usize,
+    base: usize,
+    last_span: Option<Span>,
 }
 
 impl Vm {
     pub fn new() -> Self {
         Self {
             stack: Vec::new(),
-            instruction_pointer: 0,
+            frames: Vec::new(),
             globals: HashMap::new(),
         }
     }
@@ -245,31 +302,46 @@ impl Vm {
     /// Executes `chunk` until `Return` or a structured [`VmError`].
     ///
     /// `Return` yields the top stack value. If the stack is empty, it yields
-    /// [`Value::Null`]. The stack and instruction pointer are cleared on both
+    /// [`Value::Null`]. The stack and call frames are cleared on both
     /// success and failure, while global bindings persist.
     pub fn run(&mut self, chunk: &Chunk) -> Result<Value, VmError> {
         self.reset_execution_state();
-        let result = self.execute(chunk);
+        let script = Rc::new(Function::new("<script>", Arity::new(0), chunk.clone()));
+        self.frames.push(CallFrame {
+            function: script,
+            instruction_pointer: 0,
+            base: 0,
+            last_span: None,
+        });
+        let result = self.execute();
         self.reset_execution_state();
         result
     }
 
-    fn execute(&mut self, chunk: &Chunk) -> Result<Value, VmError> {
-        let mut last_span = None;
-
+    fn execute(&mut self) -> Result<Value, VmError> {
         loop {
-            let instruction_offset = self.instruction_pointer;
-            let instruction = chunk.instruction(instruction_offset).copied().ok_or(
-                VmError::InstructionPointerOutOfBounds {
-                    instruction_pointer: self.instruction_pointer,
-                    instruction_count: chunk.instructions().len(),
-                    last_span,
-                },
-            )?;
-
-            self.instruction_pointer += 1;
+            let (function, instruction_offset, instruction) = {
+                let frame = self
+                    .frames
+                    .last_mut()
+                    .expect("the script frame remains active until execution returns");
+                let instruction_offset = frame.instruction_pointer;
+                let instruction = frame
+                    .function
+                    .chunk()
+                    .instruction(instruction_offset)
+                    .copied()
+                    .ok_or(VmError::InstructionPointerOutOfBounds {
+                        instruction_pointer: instruction_offset,
+                        instruction_count: frame.function.chunk().instructions().len(),
+                        last_span: frame.last_span,
+                    })?;
+                frame.instruction_pointer += 1;
+                frame.last_span = Some(instruction.span());
+                (Rc::clone(&frame.function), instruction_offset, instruction)
+            };
+            let chunk = function.chunk();
             let span = instruction.span();
-            last_span = Some(span);
 
             match instruction.opcode() {
                 OpCode::Constant(index) => {
@@ -350,9 +422,87 @@ impl Vm {
                         span,
                     )?;
                 }
-                OpCode::Return => return Ok(self.stack.pop().unwrap_or(Value::Null)),
+                OpCode::Call(arity) => {
+                    self.execute_call(arity, instruction_offset, span)?;
+                }
+                OpCode::Return => {
+                    if let Some(result) = self.execute_return() {
+                        return Ok(result);
+                    }
+                }
             }
         }
+    }
+
+    fn execute_call(
+        &mut self,
+        arity: Arity,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let needed = arity.as_usize() + 1;
+        if self.stack.len() < needed {
+            return Err(VmError::StackUnderflow {
+                instruction_offset,
+                opcode: OpCode::Call(arity),
+                needed,
+                available: self.stack.len(),
+                span,
+            });
+        }
+        let callee_index = self.stack.len() - needed;
+        let callee = self.stack[callee_index].clone();
+        let Value::Function(function) = callee else {
+            return Err(VmError::NotCallable {
+                instruction_offset,
+                value: callee,
+                span,
+            });
+        };
+        if function.arity() != arity {
+            return Err(VmError::ArityMismatch {
+                instruction_offset,
+                function: function.name().to_owned(),
+                expected: function.arity(),
+                got: arity,
+                span,
+            });
+        }
+        let active_calls = self.frames.len().saturating_sub(1);
+        if active_calls >= MAX_CALL_FRAMES {
+            return Err(VmError::CallStackOverflow {
+                instruction_offset,
+                limit: MAX_CALL_FRAMES,
+                span,
+            });
+        }
+        self.frames.push(CallFrame {
+            function,
+            instruction_pointer: 0,
+            base: callee_index + 1,
+            last_span: None,
+        });
+        Ok(())
+    }
+
+    fn execute_return(&mut self) -> Option<Value> {
+        let result = self.stack.pop().unwrap_or(Value::Null);
+        if self.frames.len() == 1 {
+            self.frames.pop();
+            return Some(result);
+        }
+
+        let frame = self
+            .frames
+            .pop()
+            .expect("a non-script return always has a function frame");
+        let callee_index = frame
+            .base
+            .checked_sub(1)
+            .expect("function frame bases follow their callee");
+        self.stack.truncate(callee_index);
+        self.stack.push(result);
+        None
     }
 
     fn execute_binary(
@@ -697,15 +847,19 @@ impl Vm {
 
     /// Resolves a frame-relative local slot to its absolute stack index.
     ///
-    /// VM-07 has a single implicit frame starting at zero. Future call frames
-    /// can supply a different base here without changing either local opcode.
+    /// The script frame starts at zero. Function frames start immediately after
+    /// their callee, so slot zero addresses the first argument.
     fn resolve_local_index(
         &self,
         slot: LocalSlot,
         instruction_offset: usize,
         span: Span,
     ) -> Result<usize, VmError> {
-        let frame_base = 0usize;
+        let frame_base = self
+            .frames
+            .last()
+            .expect("local access requires an active frame")
+            .base;
         let stack_len = self.stack.len();
         frame_base
             .checked_add(slot.as_usize())
@@ -727,8 +881,9 @@ impl Vm {
         instruction_offset: usize,
         span: Span,
     ) -> Result<(), VmError> {
-        self.instruction_pointer =
+        let target =
             Self::checked_jump_target(chunk, opcode, offset, direction, instruction_offset, span)?;
+        self.current_frame_mut().instruction_pointer = target;
         Ok(())
     }
 
@@ -761,7 +916,7 @@ impl Vm {
         )?;
 
         if should_jump {
-            self.instruction_pointer = target;
+            self.current_frame_mut().instruction_pointer = target;
         }
         Ok(())
     }
@@ -878,7 +1033,13 @@ impl Vm {
 
     fn reset_execution_state(&mut self) {
         self.stack.clear();
-        self.instruction_pointer = 0;
+        self.frames.clear();
+    }
+
+    fn current_frame_mut(&mut self) -> &mut CallFrame {
+        self.frames
+            .last_mut()
+            .expect("instruction execution requires an active frame")
     }
 }
 
@@ -985,7 +1146,7 @@ mod tests {
         let vm = Vm::new();
 
         assert!(vm.stack.is_empty());
-        assert_eq!(vm.instruction_pointer, 0);
+        assert!(vm.frames.is_empty());
     }
 
     #[test]
@@ -1407,7 +1568,7 @@ mod tests {
         assert!(matches!(vm.run(&invalid), Err(VmError::TypeError { .. })));
         assert_eq!(vm.run(&valid), Ok(Value::Int(30)));
         assert!(vm.stack.is_empty());
-        assert_eq!(vm.instruction_pointer, 0);
+        assert!(vm.frames.is_empty());
     }
 
     #[test]
@@ -1778,7 +1939,7 @@ mod tests {
         assert!(matches!(vm.run(&invalid), Err(VmError::TypeError { .. })));
         assert_eq!(vm.run(&valid), Ok(Value::Bool(true)));
         assert!(vm.stack.is_empty());
-        assert_eq!(vm.instruction_pointer, 0);
+        assert!(vm.frames.is_empty());
     }
 
     #[test]
@@ -1992,7 +2153,7 @@ mod tests {
         ));
         assert_eq!(vm.run(&get_global_chunk("x")), Ok(Value::Int(10)));
         assert!(vm.stack.is_empty());
-        assert_eq!(vm.instruction_pointer, 0);
+        assert!(vm.frames.is_empty());
     }
 
     #[test]
@@ -2250,7 +2411,7 @@ mod tests {
         ));
         assert_eq!(vm.run(&valid), Ok(Value::Int(42)));
         assert!(vm.stack.is_empty());
-        assert_eq!(vm.instruction_pointer, 0);
+        assert!(vm.frames.is_empty());
     }
 
     #[test]
@@ -2571,7 +2732,7 @@ mod tests {
         ));
         assert_eq!(vm.run(&valid), Ok(Value::Bool(true)));
         assert!(vm.stack.is_empty());
-        assert_eq!(vm.instruction_pointer, 0);
+        assert!(vm.frames.is_empty());
     }
 
     #[test]
@@ -2638,7 +2799,7 @@ mod tests {
         assert_eq!(vm.run(&first), Ok(Value::Bool(true)));
         assert_eq!(vm.run(&second), Ok(Value::Null));
         assert!(vm.stack.is_empty());
-        assert_eq!(vm.instruction_pointer, 0);
+        assert!(vm.frames.is_empty());
     }
 
     #[test]

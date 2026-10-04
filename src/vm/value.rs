@@ -1,4 +1,7 @@
 use std::fmt;
+use std::rc::Rc;
+
+use super::Function;
 
 /// A runtime value suitable for storage in VM bytecode constant pools.
 ///
@@ -6,13 +9,28 @@ use std::fmt;
 /// The tree-walking interpreter stores environments, functions, and shared
 /// mutable collections, while the VM will eventually use its own stack and
 /// object representation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Value {
     Null,
     Bool(bool),
     Int(i64),
     Float(f64),
     String(String),
+    Function(Rc<Function>),
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Bool(left), Self::Bool(right)) => left == right,
+            (Self::Int(left), Self::Int(right)) => left == right,
+            (Self::Float(left), Self::Float(right)) => left == right,
+            (Self::String(left), Self::String(right)) => left == right,
+            (Self::Function(left), Self::Function(right)) => Rc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
 }
 
 impl Value {
@@ -25,6 +43,7 @@ impl Value {
             Self::Int(value) => *value != 0,
             Self::Float(value) => *value != 0.0 && !value.is_nan(),
             Self::String(value) => !value.is_empty(),
+            Self::Function(_) => true,
         }
     }
 }
@@ -37,13 +56,17 @@ impl fmt::Display for Value {
             Self::Int(value) => write!(f, "{value}"),
             Self::Float(value) => write!(f, "{value}"),
             Self::String(value) => write!(f, "{value}"),
+            Self::Function(function) => write!(f, "<fn {}>", function.name()),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::Value;
+    use crate::vm::{Arity, Chunk, Function};
 
     #[test]
     fn values_compare_by_type_and_contents() {
@@ -88,5 +111,18 @@ mod tests {
         assert!(Value::Float(0.5).is_truthy());
         assert!(!Value::String(String::new()).is_truthy());
         assert!(Value::String("hanlin".to_owned()).is_truthy());
+    }
+
+    #[test]
+    fn function_values_use_identity_equality_and_deterministic_display() {
+        let function = Rc::new(Function::new("add", Arity::new(2), Chunk::new()));
+        let same = Value::Function(Rc::clone(&function));
+        let original = Value::Function(function);
+        let distinct = Value::Function(Rc::new(Function::new("add", Arity::new(2), Chunk::new())));
+
+        assert_eq!(original.to_string(), "<fn add>");
+        assert_eq!(original, same);
+        assert_ne!(original, distinct);
+        assert!(original.is_truthy());
     }
 }

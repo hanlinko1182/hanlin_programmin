@@ -1,5 +1,70 @@
 use std::fmt;
 
+/// The number of arguments supplied by a call instruction.
+///
+/// The explicit byte-sized representation keeps the bytecode operand bounded.
+/// Convert from [`usize`] with [`TryFrom`] so oversized call sites are rejected
+/// instead of silently truncated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Arity(u8);
+
+impl Arity {
+    pub const MAX: Self = Self(u8::MAX);
+
+    pub const fn new(arity: u8) -> Self {
+        Self(arity)
+    }
+
+    pub const fn as_u8(self) -> u8 {
+        self.0
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl From<u8> for Arity {
+    fn from(arity: u8) -> Self {
+        Self::new(arity)
+    }
+}
+
+impl TryFrom<usize> for Arity {
+    type Error = ArityError;
+
+    fn try_from(arity: usize) -> Result<Self, Self::Error> {
+        u8::try_from(arity)
+            .map(Self::new)
+            .map_err(|_| ArityError { arity })
+    }
+}
+
+/// A platform-sized argument count that cannot fit in [`Arity`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArityError {
+    arity: usize,
+}
+
+impl ArityError {
+    pub const fn arity(self) -> usize {
+        self.arity
+    }
+}
+
+impl fmt::Display for ArityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "arity {} exceeds the maximum supported arity {}",
+            self.arity,
+            Arity::MAX.as_u8()
+        )
+    }
+}
+
+impl std::error::Error for ArityError {}
+
 /// An index into a [`Chunk`](super::chunk::Chunk)'s constant pool.
 ///
 /// The explicit width prevents a future bytecode encoder from accidentally
@@ -190,8 +255,7 @@ pub(crate) fn resolve_jump_target(
 /// A single operation understood by Hanlin's future stack-based VM.
 ///
 /// Variants carry their operands directly. This keeps constant indexes, local
-/// slots, and jump distances strongly typed while leaving room for later
-/// operands such as call arity.
+/// slots, jump distances, and call arities strongly typed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpCode {
     Constant(ConstantIndex),
@@ -220,12 +284,30 @@ pub enum OpCode {
     Jump(JumpOffset),
     JumpIfFalse(JumpOffset),
     Loop(JumpOffset),
+    Call(Arity),
     Return,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{JumpOffset, JumpOffsetError, LocalSlot, LocalSlotError};
+    use super::{Arity, ArityError, JumpOffset, JumpOffsetError, LocalSlot, LocalSlotError};
+
+    #[test]
+    fn constructs_valid_arity() {
+        let arity = Arity::new(3);
+
+        assert_eq!(arity.as_u8(), 3);
+        assert_eq!(arity.as_usize(), 3);
+    }
+
+    #[test]
+    fn rejects_arity_overflow() {
+        let attempted = usize::from(u8::MAX) + 1;
+        let error = Arity::try_from(attempted).unwrap_err();
+
+        assert_eq!(error, ArityError { arity: attempted });
+        assert_eq!(error.arity(), attempted);
+    }
 
     #[test]
     fn constructs_valid_local_slot() {

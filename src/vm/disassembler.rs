@@ -7,7 +7,7 @@ use std::fmt;
 use std::fmt::Write;
 
 use super::opcode::{resolve_jump_target, JumpDirection};
-use super::{Chunk, ConstantIndex, JumpOffset, LocalSlot, OpCode, Value};
+use super::{Arity, Chunk, ConstantIndex, JumpOffset, LocalSlot, OpCode, Value};
 
 /// An error found while disassembling a bytecode chunk.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,6 +112,7 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> Result<String, D
         OpCode::GetLocal(slot) | OpCode::SetLocal(slot) => {
             Ok(format_local_instruction(offset, &span, name, slot))
         }
+        OpCode::Call(arity) => Ok(format_arity_instruction(offset, &span, name, arity)),
         OpCode::Jump(jump_offset) | OpCode::JumpIfFalse(jump_offset) => format_jump_instruction(
             chunk,
             offset,
@@ -136,6 +137,10 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> Result<String, D
 
 fn format_local_instruction(offset: usize, span: &str, name: &str, slot: LocalSlot) -> String {
     format!("{offset:04}  {span:<6} {name:<14} {}", slot.as_u16())
+}
+
+fn format_arity_instruction(offset: usize, span: &str, name: &str, arity: Arity) -> String {
+    format!("{offset:04}  {span:<6} {name:<14} {}", arity.as_u8())
 }
 
 fn format_jump_instruction(
@@ -218,6 +223,7 @@ fn opcode_name(opcode: OpCode) -> &'static str {
         OpCode::Jump(_) => "JUMP",
         OpCode::JumpIfFalse(_) => "JUMP_IF_FALSE",
         OpCode::Loop(_) => "LOOP",
+        OpCode::Call(_) => "CALL",
         OpCode::Return => "RETURN",
     }
 }
@@ -234,9 +240,11 @@ fn format_constant(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::{disassemble_chunk, disassemble_instruction, DisassembleError};
     use crate::error::Span;
-    use crate::vm::{Chunk, ConstantIndex, JumpOffset, LocalSlot, OpCode, Value};
+    use crate::vm::{Arity, Chunk, ConstantIndex, Function, JumpOffset, LocalSlot, OpCode, Value};
 
     fn chunk_with(opcodes: &[OpCode]) -> Chunk {
         let mut chunk = Chunk::new();
@@ -288,6 +296,29 @@ mod tests {
         assert_eq!(
             disassemble_instruction(&chunk, 0).unwrap(),
             "0000  2:10   CONSTANT       0    \"hello\\nworld\""
+        );
+    }
+
+    #[test]
+    fn disassembles_function_constant_without_nested_chunk_dump() {
+        let mut chunk = Chunk::new();
+        let function = Value::Function(Rc::new(Function::new("add", Arity::new(2), Chunk::new())));
+        let index = chunk.add_constant(function).unwrap();
+        chunk.write_instruction(OpCode::Constant(index), Span::new(1, 1));
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0).unwrap(),
+            "0000  1:1    CONSTANT       0    <fn add>"
+        );
+    }
+
+    #[test]
+    fn disassembles_call_arity() {
+        let chunk = chunk_with(&[OpCode::Call(Arity::new(2))]);
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0).unwrap(),
+            "0000  1:1    CALL           2"
         );
     }
 

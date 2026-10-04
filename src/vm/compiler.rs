@@ -1,17 +1,20 @@
 //! AST-to-bytecode compiler for Hanlin's stack VM.
 //!
-//! The compiler supports primitive expressions, top-level globals, control
-//! flow, and short-circuit logical expressions. Supported expression nodes do
-//! not carry source spans in the current AST, so their containing statement's
-//! span is applied to every instruction they emit. An empty program uses
-//! [`EMPTY_PROGRAM_SPAN`] for its synthetic `Null` and `Return` instructions.
+//! The compiler supports primitive expressions, globals, control flow,
+//! short-circuit logical expressions, and named functions with frame-local
+//! parameters and variables. Supported expression nodes do not carry source
+//! spans in the current AST, so their containing statement's span is applied
+//! to every instruction they emit. An empty program uses [`EMPTY_PROGRAM_SPAN`]
+//! for its synthetic `Null` and `Return` instructions.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
 use crate::ast::{BinOp, Expr, Literal, Program, Stmt, UnOp};
 use crate::error::Span;
 
-use super::{Chunk, ChunkError, JumpOffset, OpCode, Value};
+use super::{Arity, Chunk, ChunkError, Function, JumpOffset, LocalSlot, OpCode, Value};
 
 const EMPTY_PROGRAM_SPAN: Span = Span { line: 1, col: 1 };
 
@@ -34,6 +37,34 @@ pub enum CompileError {
         span: Span,
     },
     ContinueOutsideLoop {
+        span: Span,
+    },
+    ReturnOutsideFunction {
+        span: Span,
+    },
+    NestedFunctionUnsupported {
+        name: String,
+        span: Span,
+    },
+    BlockLocalUnsupported {
+        name: String,
+        span: Span,
+    },
+    TooManyParameters {
+        function: String,
+        count: usize,
+        maximum: usize,
+        span: Span,
+    },
+    TooManyArguments {
+        count: usize,
+        maximum: usize,
+        span: Span,
+    },
+    TooManyLocals {
+        function: String,
+        count: usize,
+        maximum: usize,
         span: Span,
     },
     JumpTooLarge {
@@ -67,6 +98,43 @@ impl fmt::Display for CompileError {
             Self::ContinueOutsideLoop { span } => {
                 write!(f, "continue outside a loop at {span}")
             }
+            Self::ReturnOutsideFunction { span } => {
+                write!(f, "return outside a function at {span}")
+            }
+            Self::NestedFunctionUnsupported { name, span } => write!(
+                f,
+                "nested function declaration '{name}' is unsupported without closures at {span}"
+            ),
+            Self::BlockLocalUnsupported { name, span } => write!(
+                f,
+                "block-local declaration '{name}' is unsupported in VM functions at {span}"
+            ),
+            Self::TooManyParameters {
+                function,
+                count,
+                maximum,
+                span,
+            } => write!(
+                f,
+                "function '{function}' has {count} parameters, exceeding the maximum {maximum} at {span}"
+            ),
+            Self::TooManyArguments {
+                count,
+                maximum,
+                span,
+            } => write!(
+                f,
+                "call has {count} arguments, exceeding the maximum {maximum} at {span}"
+            ),
+            Self::TooManyLocals {
+                function,
+                count,
+                maximum,
+                span,
+            } => write!(
+                f,
+                "function '{function}' needs {count} local slots, exceeding the maximum {maximum} at {span}"
+            ),
             Self::JumpTooLarge { distance, span } => write!(
                 f,
                 "jump distance {distance} exceeds the bytecode operand capacity at {span}"
@@ -101,24 +169,36 @@ struct LoopContext {
     break_jumps: Vec<PendingJump>,
 }
 
+#[derive(Debug)]
+struct FunctionContext {
+    name: String,
+    locals: HashMap<String, LocalSlot>,
+    next_slot: usize,
+    block_depth: usize,
+}
+
 /// Compiles the supported subset of Hanlin's existing AST into a [`Chunk`].
 #[derive(Debug, Default)]
 pub struct Compiler {
     loop_contexts: Vec<LoopContext>,
+    function_context: Option<FunctionContext>,
 }
 
 impl Compiler {
     pub const fn new() -> Self {
         Self {
             loop_contexts: Vec::new(),
+            function_context: None,
         }
     }
 
     /// Compiles a top-level program and always emits explicit termination.
     pub fn compile(&mut self, program: &Program) -> Result<Chunk, CompileError> {
         self.loop_contexts.clear();
+        self.function_context = None;
         let result = self.compile_program(program);
         self.loop_contexts.clear();
+        self.function_context = None;
         result
     }
 
@@ -144,27 +224,19 @@ impl Compiler {
         match statement {
             Stmt::VarDecl {
                 name, init, span, ..
-            } => {
-                if let Some(initializer) = init {
-                    Self::compile_expression(chunk, initializer, *span)?;
-                } else {
-                    chunk.write_instruction(OpCode::Null, *span);
-                }
-                let name = Self::add_constant(chunk, Value::String(name.clone()), *span)?;
-                chunk.write_instruction(OpCode::DefineGlobal(name), *span);
-                Ok(())
-            }
+            } => self.compile_variable_declaration(chunk, name, init.as_ref(), *span),
             Stmt::Expression { expr, span } => {
-                Self::compile_expression(chunk, expr, *span)?;
+                self.compile_expression(chunk, expr, *span)?;
                 chunk.write_instruction(OpCode::Pop, *span);
                 Ok(())
             }
-            Stmt::FnDecl { span, .. } => {
-                Err(Self::unsupported_statement("function declaration", *span))
-            }
-            Stmt::Return { span, .. } => {
-                Err(Self::unsupported_statement("return statement", *span))
-            }
+            Stmt::FnDecl {
+                name,
+                params,
+                body,
+                span,
+            } => self.compile_function_declaration(chunk, name, params, body, *span),
+            Stmt::Return { value, span } => self.compile_return(chunk, value.as_ref(), *span),
             Stmt::If {
                 condition,
                 then_body,
@@ -186,6 +258,127 @@ impl Compiler {
         }
     }
 
+    fn compile_variable_declaration(
+        &mut self,
+        chunk: &mut Chunk,
+        name: &str,
+        initializer: Option<&Expr>,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        if self
+            .function_context
+            .as_ref()
+            .is_some_and(|context| context.block_depth > 0)
+        {
+            return Err(CompileError::BlockLocalUnsupported {
+                name: name.to_owned(),
+                span,
+            });
+        }
+
+        if let Some(initializer) = initializer {
+            self.compile_expression(chunk, initializer, span)?;
+        } else {
+            chunk.write_instruction(OpCode::Null, span);
+        }
+
+        if let Some(context) = self.function_context.as_mut() {
+            let slot = LocalSlot::try_from(context.next_slot).map_err(|_| {
+                CompileError::TooManyLocals {
+                    function: context.name.clone(),
+                    count: context.next_slot + 1,
+                    maximum: LocalSlot::MAX.as_usize() + 1,
+                    span,
+                }
+            })?;
+            context.next_slot += 1;
+            context.locals.insert(name.to_owned(), slot);
+            return Ok(());
+        }
+
+        let name = Self::add_constant(chunk, Value::String(name.to_owned()), span)?;
+        chunk.write_instruction(OpCode::DefineGlobal(name), span);
+        Ok(())
+    }
+
+    fn compile_function_declaration(
+        &mut self,
+        chunk: &mut Chunk,
+        name: &str,
+        params: &[String],
+        body: &[Stmt],
+        span: Span,
+    ) -> Result<(), CompileError> {
+        if self.function_context.is_some() {
+            return Err(CompileError::NestedFunctionUnsupported {
+                name: name.to_owned(),
+                span,
+            });
+        }
+
+        let arity = Arity::try_from(params.len()).map_err(|_| CompileError::TooManyParameters {
+            function: name.to_owned(),
+            count: params.len(),
+            maximum: Arity::MAX.as_usize(),
+            span,
+        })?;
+        let mut locals = HashMap::new();
+        for (index, parameter) in params.iter().enumerate() {
+            let slot =
+                LocalSlot::try_from(index).expect("u8 arity always fits in a u16 local slot");
+            locals.insert(parameter.clone(), slot);
+        }
+
+        let saved_loops = std::mem::take(&mut self.loop_contexts);
+        self.function_context = Some(FunctionContext {
+            name: name.to_owned(),
+            locals,
+            next_slot: params.len(),
+            block_depth: 0,
+        });
+
+        let mut function_chunk = Chunk::new();
+        let result = (|| {
+            let mut termination_span = span;
+            for statement in body {
+                termination_span = statement_span(statement);
+                self.compile_statement(&mut function_chunk, statement)?;
+            }
+            function_chunk.write_instruction(OpCode::Null, termination_span);
+            function_chunk.write_instruction(OpCode::Return, termination_span);
+            Ok(())
+        })();
+
+        self.function_context = None;
+        self.loop_contexts = saved_loops;
+        result?;
+
+        let function = Value::Function(Rc::new(Function::new(name, arity, function_chunk)));
+        let function = Self::add_constant(chunk, function, span)?;
+        chunk.write_instruction(OpCode::Constant(function), span);
+        let global_name = Self::add_constant(chunk, Value::String(name.to_owned()), span)?;
+        chunk.write_instruction(OpCode::DefineGlobal(global_name), span);
+        Ok(())
+    }
+
+    fn compile_return(
+        &mut self,
+        chunk: &mut Chunk,
+        value: Option<&Expr>,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        if self.function_context.is_none() {
+            return Err(CompileError::ReturnOutsideFunction { span });
+        }
+        if let Some(value) = value {
+            self.compile_expression(chunk, value, span)?;
+        } else {
+            chunk.write_instruction(OpCode::Null, span);
+        }
+        chunk.write_instruction(OpCode::Return, span);
+        Ok(())
+    }
+
     fn compile_if(
         &mut self,
         chunk: &mut Chunk,
@@ -194,17 +387,17 @@ impl Compiler {
         else_body: Option<&[Stmt]>,
         span: Span,
     ) -> Result<(), CompileError> {
-        Self::compile_expression(chunk, condition, span)?;
+        self.compile_expression(chunk, condition, span)?;
         let false_jump = Self::emit_jump(chunk, true, span);
         chunk.write_instruction(OpCode::Pop, span);
 
-        self.compile_statements(chunk, then_body)?;
+        self.compile_nested_statements(chunk, then_body)?;
         let end_jump = Self::emit_jump(chunk, false, span);
 
         Self::patch_jump(chunk, false_jump, chunk.instructions().len(), span)?;
         chunk.write_instruction(OpCode::Pop, span);
         if let Some(else_body) = else_body {
-            self.compile_statements(chunk, else_body)?;
+            self.compile_nested_statements(chunk, else_body)?;
         }
 
         Self::patch_jump(chunk, end_jump, chunk.instructions().len(), span)
@@ -218,7 +411,7 @@ impl Compiler {
         span: Span,
     ) -> Result<(), CompileError> {
         let loop_start = chunk.instructions().len();
-        Self::compile_expression(chunk, condition, span)?;
+        self.compile_expression(chunk, condition, span)?;
         let exit_jump = Self::emit_jump(chunk, true, span);
         chunk.write_instruction(OpCode::Pop, span);
 
@@ -227,7 +420,7 @@ impl Compiler {
             continue_target: loop_start,
             break_jumps: Vec::new(),
         });
-        self.compile_statements(chunk, body)?;
+        self.compile_nested_statements(chunk, body)?;
         Self::emit_loop(chunk, loop_start, span)?;
 
         Self::patch_jump(chunk, exit_jump, chunk.instructions().len(), span)?;
@@ -284,6 +477,21 @@ impl Compiler {
             self.compile_statement(chunk, statement)?;
         }
         Ok(())
+    }
+
+    fn compile_nested_statements(
+        &mut self,
+        chunk: &mut Chunk,
+        statements: &[Stmt],
+    ) -> Result<(), CompileError> {
+        if let Some(context) = self.function_context.as_mut() {
+            context.block_depth += 1;
+        }
+        let result = self.compile_statements(chunk, statements);
+        if let Some(context) = self.function_context.as_mut() {
+            context.block_depth -= 1;
+        }
+        result
     }
 
     fn emit_jump(chunk: &mut Chunk, conditional: bool, span: Span) -> usize {
@@ -348,6 +556,7 @@ impl Compiler {
     }
 
     fn compile_expression(
+        &mut self,
         chunk: &mut Chunk,
         expression: &Expr,
         fallback_span: Span,
@@ -355,12 +564,17 @@ impl Compiler {
         match expression {
             Expr::Literal(literal) => Self::compile_literal(chunk, literal, fallback_span),
             Expr::Identifier(name) => {
-                let name = Self::add_constant(chunk, Value::String(name.clone()), fallback_span)?;
-                chunk.write_instruction(OpCode::GetGlobal(name), fallback_span);
+                if let Some(slot) = self.resolve_local(name) {
+                    chunk.write_instruction(OpCode::GetLocal(slot), fallback_span);
+                } else {
+                    let name =
+                        Self::add_constant(chunk, Value::String(name.clone()), fallback_span)?;
+                    chunk.write_instruction(OpCode::GetGlobal(name), fallback_span);
+                }
                 Ok(())
             }
             Expr::Unary { op, expr } => {
-                Self::compile_expression(chunk, expr, fallback_span)?;
+                self.compile_expression(chunk, expr, fallback_span)?;
                 let opcode = match op {
                     UnOp::Neg => OpCode::Negate,
                     UnOp::Not => OpCode::Not,
@@ -371,23 +585,28 @@ impl Compiler {
             Expr::Binary { op, left, right } => {
                 match op {
                     BinOp::And => {
-                        return Self::compile_logical_and(chunk, left, right, fallback_span);
+                        return self.compile_logical_and(chunk, left, right, fallback_span);
                     }
                     BinOp::Or => {
-                        return Self::compile_logical_or(chunk, left, right, fallback_span);
+                        return self.compile_logical_or(chunk, left, right, fallback_span);
                     }
                     _ => {}
                 }
                 let opcode = Self::binary_opcode(*op);
-                Self::compile_expression(chunk, left, fallback_span)?;
-                Self::compile_expression(chunk, right, fallback_span)?;
+                self.compile_expression(chunk, left, fallback_span)?;
+                self.compile_expression(chunk, right, fallback_span)?;
                 chunk.write_instruction(opcode, fallback_span);
                 Ok(())
             }
             Expr::Assign { name, value } => {
-                Self::compile_expression(chunk, value, fallback_span)?;
-                let name = Self::add_constant(chunk, Value::String(name.clone()), fallback_span)?;
-                chunk.write_instruction(OpCode::SetGlobal(name), fallback_span);
+                self.compile_expression(chunk, value, fallback_span)?;
+                if let Some(slot) = self.resolve_local(name) {
+                    chunk.write_instruction(OpCode::SetLocal(slot), fallback_span);
+                } else {
+                    let name =
+                        Self::add_constant(chunk, Value::String(name.clone()), fallback_span)?;
+                    chunk.write_instruction(OpCode::SetGlobal(name), fallback_span);
+                }
                 Ok(())
             }
             Expr::ArrayLiteral { span, .. } => {
@@ -407,37 +626,60 @@ impl Compiler {
             Expr::AssignMember { span, .. } => {
                 Err(Self::unsupported_expression("member assignment", *span))
             }
-            Expr::Call { .. } => Err(Self::unsupported_expression("function call", fallback_span)),
+            Expr::Call { callee, args } => {
+                let arity =
+                    Arity::try_from(args.len()).map_err(|_| CompileError::TooManyArguments {
+                        count: args.len(),
+                        maximum: Arity::MAX.as_usize(),
+                        span: fallback_span,
+                    })?;
+                let callee =
+                    Self::add_constant(chunk, Value::String(callee.clone()), fallback_span)?;
+                chunk.write_instruction(OpCode::GetGlobal(callee), fallback_span);
+                for argument in args {
+                    self.compile_expression(chunk, argument, fallback_span)?;
+                }
+                chunk.write_instruction(OpCode::Call(arity), fallback_span);
+                Ok(())
+            }
         }
     }
 
     fn compile_logical_and(
+        &mut self,
         chunk: &mut Chunk,
         left: &Expr,
         right: &Expr,
         span: Span,
     ) -> Result<(), CompileError> {
-        Self::compile_expression(chunk, left, span)?;
+        self.compile_expression(chunk, left, span)?;
         let end_jump = Self::emit_jump(chunk, true, span);
         chunk.write_instruction(OpCode::Pop, span);
-        Self::compile_expression(chunk, right, span)?;
+        self.compile_expression(chunk, right, span)?;
         Self::patch_jump(chunk, end_jump, chunk.instructions().len(), span)
     }
 
     fn compile_logical_or(
+        &mut self,
         chunk: &mut Chunk,
         left: &Expr,
         right: &Expr,
         span: Span,
     ) -> Result<(), CompileError> {
-        Self::compile_expression(chunk, left, span)?;
+        self.compile_expression(chunk, left, span)?;
         let right_jump = Self::emit_jump(chunk, true, span);
         let end_jump = Self::emit_jump(chunk, false, span);
 
         Self::patch_jump(chunk, right_jump, chunk.instructions().len(), span)?;
         chunk.write_instruction(OpCode::Pop, span);
-        Self::compile_expression(chunk, right, span)?;
+        self.compile_expression(chunk, right, span)?;
         Self::patch_jump(chunk, end_jump, chunk.instructions().len(), span)
+    }
+
+    fn resolve_local(&self, name: &str) -> Option<LocalSlot> {
+        self.function_context
+            .as_ref()
+            .and_then(|context| context.locals.get(name).copied())
     }
 
     fn compile_literal(
@@ -526,7 +768,10 @@ mod tests {
     use crate::interpreter::{Env, Interpreter};
     use crate::lexer::Lexer;
     use crate::parser::Parser;
-    use crate::vm::{disassemble_chunk, Chunk, JumpOffset, OpCode, Value, Vm};
+    use crate::vm::{
+        disassemble_chunk, Arity, Chunk, Function, JumpOffset, LocalSlot, OpCode, Value, Vm,
+        VmError, MAX_CALL_FRAMES,
+    };
 
     fn parse_source(source: &str) -> crate::ast::Program {
         let tokens = Lexer::new(source).tokenize().unwrap();
@@ -540,6 +785,25 @@ mod tests {
     fn run_source(source: &str) -> Value {
         let chunk = compile_source(source).unwrap();
         Vm::new().run(&chunk).unwrap()
+    }
+
+    fn run_source_result(source: &str) -> Result<Value, VmError> {
+        let chunk = compile_source(source).unwrap();
+        Vm::new().run(&chunk)
+    }
+
+    fn compiled_function(source: &str, name: &str) -> std::rc::Rc<Function> {
+        compile_source(source)
+            .unwrap()
+            .constants()
+            .iter()
+            .find_map(|value| match value {
+                Value::Function(function) if function.name() == name => {
+                    Some(std::rc::Rc::clone(function))
+                }
+                _ => None,
+            })
+            .unwrap()
     }
 
     fn run_source_and_get(source: &str, name: &str) -> Value {
@@ -1453,11 +1717,446 @@ mod tests {
     }
 
     #[test]
+    fn function_declaration_defines_global_callable() {
+        let chunk = compile_source("fn answer() { return 42; }").unwrap();
+        let mut vm = Vm::new();
+
+        assert_eq!(vm.run(&chunk), Ok(Value::Null));
+        assert_eq!(read_global(&mut vm, "answer").to_string(), "<fn answer>");
+    }
+
+    #[test]
+    fn calls_zero_argument_function() {
+        assert_eq!(
+            run_source_and_get(
+                "fn answer() { return 42; } let result = answer();",
+                "result"
+            ),
+            Value::Int(42)
+        );
+    }
+
+    #[test]
+    fn calls_one_argument_function() {
+        assert_eq!(
+            run_source_and_get(
+                "fn identity(value) { return value; } let result = identity(7);",
+                "result"
+            ),
+            Value::Int(7)
+        );
+    }
+
+    #[test]
+    fn calls_function_with_multiple_arguments() {
+        assert_eq!(
+            run_source_and_get(
+                "fn add(a, b, c) { return a + b + c; } let result = add(10, 20, 12);",
+                "result"
+            ),
+            Value::Int(42)
+        );
+    }
+
+    #[test]
+    fn function_returns_float() {
+        assert_eq!(
+            run_source_and_get("fn value() { return 2.5; } let result = value();", "result"),
+            Value::Float(2.5)
+        );
+    }
+
+    #[test]
+    fn function_returns_string() {
+        assert_eq!(
+            run_source_and_get(
+                "fn value() { return \"hanlin\"; } let result = value();",
+                "result"
+            ),
+            Value::String("hanlin".to_owned())
+        );
+    }
+
+    #[test]
+    fn function_implicit_return_is_null() {
+        assert_eq!(
+            run_source_and_get("fn noop() { let x = 1; } let result = noop();", "result"),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn function_bare_return_is_null() {
+        assert_eq!(
+            run_source_and_get("fn noop() { return; } let result = noop();", "result"),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn parameter_compiles_to_local_slot_zero() {
+        let function = compiled_function("fn identity(value) { return value; }", "identity");
+
+        assert_eq!(
+            function.chunk().instruction(0).unwrap().opcode(),
+            OpCode::GetLocal(LocalSlot::new(0))
+        );
+    }
+
+    #[test]
+    fn multiple_parameters_use_distinct_local_slots() {
+        let function = compiled_function("fn subtract(a, b) { return a - b; }", "subtract");
+        let opcodes: Vec<_> = function
+            .chunk()
+            .instructions()
+            .iter()
+            .map(|instruction| instruction.opcode())
+            .collect();
+
+        assert_eq!(opcodes[0], OpCode::GetLocal(LocalSlot::new(0)));
+        assert_eq!(opcodes[1], OpCode::GetLocal(LocalSlot::new(1)));
+        assert_eq!(
+            run_source_and_get(
+                "fn subtract(a, b) { return a - b; } let result = subtract(9, 4);",
+                "result"
+            ),
+            Value::Int(5)
+        );
+    }
+
+    #[test]
+    fn function_local_declaration_uses_stack_slot() {
+        assert_eq!(
+            run_source_and_get(
+                "fn add_one(x) { let y = x + 1; return y; } let result = add_one(41);",
+                "result"
+            ),
+            Value::Int(42)
+        );
+    }
+
+    #[test]
+    fn function_local_assignment_uses_set_local() {
+        let source = "fn bump(x) { let y = x; y = y + 1; return y; } let result = bump(9);";
+        let function = compiled_function(source, "bump");
+
+        assert!(function
+            .chunk()
+            .instructions()
+            .iter()
+            .any(|instruction| { instruction.opcode() == OpCode::SetLocal(LocalSlot::new(1)) }));
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(10));
+    }
+
+    #[test]
+    fn function_parameter_shadows_global() {
+        let source = "let x = 100; fn identity(x) { return x; } let result = identity(7);";
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(7));
+    }
+
+    #[test]
+    fn function_identifier_falls_back_to_global() {
+        let source = "let base = 40; fn add_base(x) { return base + x; } let result = add_base(2);";
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn too_few_arguments_is_runtime_error() {
+        let error = run_source_result("fn add(a, b) { return a + b; } add(1);").unwrap_err();
+
+        assert!(matches!(
+            error,
+            VmError::ArityMismatch {
+                function,
+                expected,
+                got,
+                ..
+            } if function == "add" && expected == Arity::new(2) && got == Arity::new(1)
+        ));
+    }
+
+    #[test]
+    fn too_many_arguments_is_runtime_error() {
+        let error = run_source_result("fn add(a, b) { return a + b; } add(1, 2, 3);").unwrap_err();
+
+        assert!(matches!(
+            error,
+            VmError::ArityMismatch {
+                function,
+                expected,
+                got,
+                ..
+            } if function == "add" && expected == Arity::new(2) && got == Arity::new(3)
+        ));
+    }
+
+    #[test]
+    fn calling_non_function_is_runtime_error() {
+        let error = run_source_result("let value = 10; value();").unwrap_err();
+
+        assert!(matches!(
+            error,
+            VmError::NotCallable {
+                value: Value::Int(10),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn call_stack_is_cleaned_after_each_return() {
+        let source = concat!(
+            "fn add_one(x) { let y = x + 1; return y; } ",
+            "let result = add_one(20) + add_one(20);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn vm_is_reusable_after_call_error() {
+        let bad = compile_source("let value = 10; value();").unwrap();
+        let good = compile_source("fn answer() { return 42; } let result = answer();").unwrap();
+        let mut vm = Vm::new();
+
+        assert!(matches!(vm.run(&bad), Err(VmError::NotCallable { .. })));
+        assert_eq!(vm.run(&good), Ok(Value::Null));
+        assert_eq!(read_global(&mut vm, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn function_can_call_another_function() {
+        let source = concat!(
+            "fn double(x) { return x * 2; } ",
+            "fn add_two(x) { return double(x) + 2; } ",
+            "let result = add_two(20);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn supports_multiple_sequential_calls() {
+        let source = concat!(
+            "fn next(x) { return x + 1; } ",
+            "let first = next(1); let second = next(first); let result = next(second);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(4));
+    }
+
+    #[test]
+    fn call_result_works_inside_arithmetic_expression() {
+        let source = "fn value() { return 6; } let result = value() * 7;";
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn nested_calls_preserve_return_values() {
+        let source = concat!(
+            "fn add(a, b) { return a + b; } ",
+            "fn double(x) { return x * 2; } ",
+            "let result = double(add(10, 11));"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn recursive_factorial_uses_call_frames() {
+        let source = concat!(
+            "fn factorial(n) { ",
+            "  if (n <= 1) { return 1; } ",
+            "  return n * factorial(n - 1); ",
+            "} ",
+            "let result = factorial(5);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(120));
+    }
+
+    #[test]
+    fn recursive_countdown_returns_at_base_case() {
+        let source = concat!(
+            "fn countdown(n) { ",
+            "  if (n <= 0) { return n; } ",
+            "  return countdown(n - 1); ",
+            "} ",
+            "let result = countdown(20);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(0));
+    }
+
+    #[test]
+    fn recursive_frames_grow_and_unwind_without_stale_values() {
+        let source = concat!(
+            "fn sum_to(n) { ",
+            "  if (n <= 0) { return 0; } ",
+            "  return n + sum_to(n - 1); ",
+            "} ",
+            "let first = sum_to(10); let result = sum_to(3) + first;"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(61));
+    }
+
+    #[test]
+    fn recursive_call_stack_limit_is_structured_error() {
+        let error = run_source_result("fn recurse() { return recurse(); } recurse();").unwrap_err();
+
+        assert!(matches!(
+            error,
+            VmError::CallStackOverflow { limit, .. } if limit == MAX_CALL_FRAMES
+        ));
+    }
+
+    #[test]
+    fn function_supports_if_else() {
+        let source = concat!(
+            "fn sign(x) { if (x < 0) { return -1; } else { return 1; } } ",
+            "let result = sign(-2);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(-1));
+    }
+
+    #[test]
+    fn function_supports_while_loop() {
+        let source = concat!(
+            "fn sum(n) { let total = 0; while (n > 0) { ",
+            "  total = total + n; n = n - 1; ",
+            "} return total; } let result = sum(6);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(21));
+    }
+
+    #[test]
+    fn return_inside_conditional_unwinds_function() {
+        let source = concat!(
+            "fn choose(flag) { if (flag) { return 42; } return 0; } ",
+            "let result = choose(true);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn return_inside_loop_unwinds_function() {
+        let source = concat!(
+            "fn first(n) { while (n > 0) { return n; } return 0; } ",
+            "let result = first(42);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn nested_function_declaration_is_compile_error() {
+        assert_eq!(
+            compile_source("fn outer() { fn inner() { return 1; } return 2; }"),
+            Err(CompileError::NestedFunctionUnsupported {
+                name: "inner".to_owned(),
+                span: Span::new(1, 14),
+            })
+        );
+    }
+
+    #[test]
+    fn block_local_declaration_in_function_is_compile_error() {
+        assert!(matches!(
+            compile_source("fn invalid() { if (true) { let value = 1; } }"),
+            Err(CompileError::BlockLocalUnsupported { name, .. }) if name == "value"
+        ));
+    }
+
+    #[test]
+    fn excessive_parameter_count_is_compile_error() {
+        let parameters = (0..=u8::MAX)
+            .map(|index| format!("p{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!("fn oversized({parameters}) {{ return null; }}");
+
+        assert!(matches!(
+            compile_source(&source),
+            Err(CompileError::TooManyParameters {
+                count: 256,
+                maximum: 255,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn excessive_call_argument_count_is_compile_error() {
+        let arguments = std::iter::repeat_n("0", usize::from(u8::MAX) + 1)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!("oversized({arguments});");
+
+        assert!(matches!(
+            compile_source(&source),
+            Err(CompileError::TooManyArguments {
+                count: 256,
+                maximum: 255,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn call_arguments_evaluate_left_to_right() {
+        let source = concat!(
+            "let x = 0; fn pair(a, b) { return a * 10 + b; } ",
+            "let result = pair(x = 1, x = 2);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(12));
+    }
+
+    #[test]
+    fn vm_matches_interpreter_for_simple_function_call() {
+        let source = "fn add(a, b) { return a + b; } let result = add(20, 22);";
+
+        assert_eq!(
+            run_source_and_get(source, "result").to_string(),
+            interpreter_global(source, "result")
+        );
+    }
+
+    #[test]
+    fn vm_matches_interpreter_for_function_with_locals() {
+        let source = "fn add_one(x) { let y = x + 1; return y; } let result = add_one(41);";
+
+        assert_eq!(
+            run_source_and_get(source, "result").to_string(),
+            interpreter_global(source, "result")
+        );
+    }
+
+    #[test]
+    fn vm_matches_interpreter_for_recursion() {
+        let source = concat!(
+            "fn factorial(n) { if (n <= 1) { return 1; } ",
+            "return n * factorial(n - 1); } let result = factorial(5);"
+        );
+
+        assert_eq!(
+            run_source_and_get(source, "result").to_string(),
+            interpreter_global(source, "result")
+        );
+    }
+
+    #[test]
     fn rejects_source_return_statement_with_span() {
         assert_eq!(
             compile_source("return 1;"),
-            Err(CompileError::UnsupportedStatement {
-                kind: "return statement",
+            Err(CompileError::ReturnOutsideFunction {
                 span: Span::new(1, 1),
             })
         );
@@ -1469,13 +2168,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_function_declaration() {
-        assert_unsupported_statement("fn answer() { return 42; }", "function declaration");
+    fn compiles_function_declaration() {
+        assert!(compile_source("fn answer() { return 42; }")
+            .unwrap()
+            .constants()
+            .iter()
+            .any(|value| matches!(value, Value::Function(_))));
     }
 
     #[test]
-    fn rejects_function_call() {
-        assert_unsupported_expression("answer();", "function call");
+    fn compiles_function_call() {
+        assert_eq!(
+            run_source_and_get(
+                "fn answer() { return 42; } let result = answer();",
+                "result"
+            ),
+            Value::Int(42)
+        );
     }
 
     #[test]

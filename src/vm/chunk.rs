@@ -145,9 +145,11 @@ impl Default for Chunk {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::{Chunk, ChunkError};
     use crate::error::Span;
-    use crate::vm::{JumpOffset, OpCode, Value};
+    use crate::vm::{Arity, Function, JumpOffset, OpCode, Value};
 
     #[test]
     fn new_chunk_is_empty() {
@@ -185,6 +187,20 @@ mod tests {
             chunk.constant(index),
             Some(&Value::String("hello".to_owned()))
         );
+    }
+
+    #[test]
+    fn stores_compiled_function_constant() {
+        let mut chunk = Chunk::new();
+        let function = Rc::new(Function::new("answer", Arity::new(0), Chunk::new()));
+        let index = chunk
+            .add_constant(Value::Function(Rc::clone(&function)))
+            .unwrap();
+
+        assert!(matches!(
+            chunk.constant(index),
+            Some(Value::Function(stored)) if Rc::ptr_eq(stored, &function)
+        ));
     }
 
     #[test]
