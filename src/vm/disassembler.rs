@@ -8,8 +8,8 @@ use std::fmt::Write;
 
 use super::opcode::{resolve_jump_target, JumpDirection};
 use super::{
-    Arity, Chunk, ConstantIndex, JumpOffset, LocalSlot, OpCode, UpvalueDescriptor, UpvalueIndex,
-    Value,
+    AggregateCount, Arity, Chunk, ConstantIndex, JumpOffset, LocalSlot, OpCode, UpvalueDescriptor,
+    UpvalueIndex, Value,
 };
 
 /// An error found while disassembling a bytecode chunk.
@@ -128,6 +128,9 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> Result<String, D
             Ok(format_upvalue_instruction(offset, &span, name, index))
         }
         OpCode::CloseUpvalue(slot) => Ok(format_local_instruction(offset, &span, name, slot)),
+        OpCode::BuildArray(count) | OpCode::BuildMap(count) => {
+            Ok(format_aggregate_instruction(offset, &span, name, count))
+        }
         OpCode::Call(arity) => Ok(format_arity_instruction(offset, &span, name, arity)),
         OpCode::Jump(jump_offset) | OpCode::JumpIfFalse(jump_offset) => format_jump_instruction(
             chunk,
@@ -157,6 +160,15 @@ fn format_local_instruction(offset: usize, span: &str, name: &str, slot: LocalSl
 
 fn format_arity_instruction(offset: usize, span: &str, name: &str, arity: Arity) -> String {
     format!("{offset:04}  {span:<6} {name:<14} {}", arity.as_u8())
+}
+
+fn format_aggregate_instruction(
+    offset: usize,
+    span: &str,
+    name: &str,
+    count: AggregateCount,
+) -> String {
+    format!("{offset:04}  {span:<6} {name:<14} {}", count.as_u16())
 }
 
 fn format_upvalue_instruction(
@@ -292,6 +304,10 @@ fn opcode_name(opcode: OpCode) -> &'static str {
         OpCode::GetUpvalue(_) => "GET_UPVALUE",
         OpCode::SetUpvalue(_) => "SET_UPVALUE",
         OpCode::CloseUpvalue(_) => "CLOSE_UPVALUE",
+        OpCode::BuildArray(_) => "BUILD_ARRAY",
+        OpCode::BuildMap(_) => "BUILD_MAP",
+        OpCode::GetIndex => "GET_INDEX",
+        OpCode::SetIndex => "SET_INDEX",
         OpCode::Call(_) => "CALL",
         OpCode::Return => "RETURN",
     }
@@ -314,8 +330,8 @@ mod tests {
     use super::{disassemble_chunk, disassemble_instruction, DisassembleError};
     use crate::error::Span;
     use crate::vm::{
-        Arity, Chunk, ConstantIndex, Function, JumpOffset, LocalSlot, OpCode, UpvalueDescriptor,
-        UpvalueIndex, Value,
+        AggregateCount, Arity, Chunk, ConstantIndex, Function, JumpOffset, LocalSlot, OpCode,
+        UpvalueDescriptor, UpvalueIndex, Value,
     };
 
     fn chunk_with(opcodes: &[OpCode]) -> Chunk {
@@ -763,6 +779,37 @@ mod tests {
                 "0000  3:4    CONSTANT       0    \"hanlin\"\n",
                 "0001  3:10   RETURN\n"
             )
+        );
+    }
+
+    #[test]
+    fn disassembles_aggregate_build_counts() {
+        let chunk = chunk_with(&[
+            OpCode::BuildArray(AggregateCount::new(3)),
+            OpCode::BuildMap(AggregateCount::new(2)),
+        ]);
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0).unwrap(),
+            "0000  1:1    BUILD_ARRAY    3"
+        );
+        assert_eq!(
+            disassemble_instruction(&chunk, 1).unwrap(),
+            "0001  1:2    BUILD_MAP      2"
+        );
+    }
+
+    #[test]
+    fn disassembles_index_instructions() {
+        let chunk = chunk_with(&[OpCode::GetIndex, OpCode::SetIndex]);
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0).unwrap(),
+            "0000  1:1    GET_INDEX"
+        );
+        assert_eq!(
+            disassemble_instruction(&chunk, 1).unwrap(),
+            "0001  1:2    SET_INDEX"
         );
     }
 }

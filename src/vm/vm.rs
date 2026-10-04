@@ -1,8 +1,8 @@
 //! Execution engine for Hanlin bytecode.
 //!
 //! The VM executes manually constructed bytecode and chunks produced by the
-//! AST compiler, including named closures and shared lexical upvalues through
-//! iterative call frames.
+//! AST compiler, including named closures, shared lexical upvalues through
+//! iterative call frames, and reference-counted mutable aggregate objects.
 //! Integer arithmetic is checked and reports [`VmError::IntegerOverflow`]
 //! instead of depending on Rust's debug or release overflow behavior.
 
@@ -17,8 +17,8 @@ use crate::error::Span;
 use super::closure::{Upvalue, UpvalueState};
 use super::opcode::{resolve_jump_target, JumpDirection};
 use super::{
-    Arity, Chunk, Closure, ConstantIndex, Function, JumpOffset, LocalSlot, OpCode,
-    UpvalueDescriptor, UpvalueIndex, Value,
+    AggregateCount, Arity, Chunk, Closure, ConstantIndex, Function, HeapObject, JumpOffset,
+    LocalSlot, OpCode, UpvalueDescriptor, UpvalueIndex, Value,
 };
 
 /// Maximum number of active Hanlin function calls, excluding the script frame.
@@ -140,6 +140,29 @@ pub enum VmError {
         instruction_offset: usize,
         stack_index: usize,
         stack_len: usize,
+        span: Span,
+    },
+    IndexTypeError {
+        instruction_offset: usize,
+        index: Value,
+        span: Span,
+    },
+    IndexOutOfBounds {
+        instruction_offset: usize,
+        index: i64,
+        length: usize,
+        assignment: bool,
+        span: Span,
+    },
+    InvalidIndexTarget {
+        instruction_offset: usize,
+        target: Value,
+        assignment: bool,
+        span: Span,
+    },
+    InvalidMapKey {
+        instruction_offset: usize,
+        key: Value,
         span: Span,
     },
 }
@@ -350,6 +373,43 @@ impl fmt::Display for VmError {
                 f,
                 "open upvalue points to stack index {stack_index}, but the stack has {stack_len} values at instruction {instruction_offset} ({span})"
             ),
+            Self::IndexTypeError {
+                instruction_offset,
+                index,
+                span,
+            } => write!(
+                f,
+                "array/string index must be an integer at instruction {instruction_offset} ({span}), got {index:?}"
+            ),
+            Self::IndexOutOfBounds {
+                instruction_offset,
+                index,
+                length,
+                assignment,
+                span,
+            } => write!(
+                f,
+                "index {index} is out of bounds for {} of length {length} at instruction {instruction_offset} ({span})",
+                if *assignment { "assignment to aggregate" } else { "aggregate" }
+            ),
+            Self::InvalidIndexTarget {
+                instruction_offset,
+                target,
+                assignment,
+                span,
+            } => write!(
+                f,
+                "cannot {} property/index of {target:?} at instruction {instruction_offset} ({span})",
+                if *assignment { "assign to" } else { "read" }
+            ),
+            Self::InvalidMapKey {
+                instruction_offset,
+                key,
+                span,
+            } => write!(
+                f,
+                "map/object index must be a string at instruction {instruction_offset} ({span}), got {key:?}"
+            ),
         }
     }
 }
@@ -527,6 +587,18 @@ impl Vm {
                 OpCode::CloseUpvalue(slot) => {
                     self.close_upvalue(slot, instruction_offset, span)?;
                 }
+                OpCode::BuildArray(count) => {
+                    self.build_array(count, instruction_offset, span)?;
+                }
+                OpCode::BuildMap(count) => {
+                    self.build_map(count, instruction_offset, span)?;
+                }
+                OpCode::GetIndex => {
+                    self.get_index(instruction_offset, span)?;
+                }
+                OpCode::SetIndex => {
+                    self.set_index(instruction_offset, span)?;
+                }
                 OpCode::Call(arity) => {
                     self.execute_call(arity, instruction_offset, span)?;
                 }
@@ -537,6 +609,211 @@ impl Vm {
                 }
             }
         }
+    }
+
+    fn build_array(
+        &mut self,
+        count: AggregateCount,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let needed = count.as_usize();
+        let available = self.stack.len();
+        if available < needed {
+            return Err(VmError::StackUnderflow {
+                instruction_offset,
+                opcode: OpCode::BuildArray(count),
+                needed,
+                available,
+                span,
+            });
+        }
+        let elements = self.stack.split_off(available - needed);
+        self.stack.push(Value::array(elements));
+        Ok(())
+    }
+
+    fn build_map(
+        &mut self,
+        count: AggregateCount,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let needed = count.as_usize() * 2;
+        let available = self.stack.len();
+        if available < needed {
+            return Err(VmError::StackUnderflow {
+                instruction_offset,
+                opcode: OpCode::BuildMap(count),
+                needed,
+                available,
+                span,
+            });
+        }
+        let start = available - needed;
+        for pair in self.stack[start..].as_chunks::<2>().0 {
+            if !matches!(pair[0], Value::String(_)) {
+                return Err(VmError::InvalidMapKey {
+                    instruction_offset,
+                    key: pair[0].clone(),
+                    span,
+                });
+            }
+        }
+
+        let pairs = self.stack.split_off(start);
+        let mut entries = HashMap::with_capacity(count.as_usize());
+        let mut pairs = pairs.into_iter();
+        while let Some(key) = pairs.next() {
+            let value = pairs.next().expect("validated map pairs contain a value");
+            let Value::String(key) = key else {
+                unreachable!("map keys were validated before stack mutation")
+            };
+            entries.insert(key, value);
+        }
+        self.stack.push(Value::map(entries));
+        Ok(())
+    }
+
+    fn get_index(&mut self, instruction_offset: usize, span: Span) -> Result<(), VmError> {
+        self.require_stack(OpCode::GetIndex, 2, instruction_offset, span)?;
+        let index = self.stack.pop().expect("stack depth was validated");
+        let target = self.stack.pop().expect("stack depth was validated");
+
+        let result = match &target {
+            Value::Heap(object) => match &*object.borrow() {
+                HeapObject::Array(elements) => {
+                    let index = Self::integer_index(index, instruction_offset, span)?;
+                    Self::checked_element(elements, index, false, instruction_offset, span)?
+                }
+                HeapObject::Map(entries) => {
+                    let Value::String(key) = index else {
+                        return Err(VmError::InvalidMapKey {
+                            instruction_offset,
+                            key: index,
+                            span,
+                        });
+                    };
+                    entries.get(&key).cloned().unwrap_or(Value::Null)
+                }
+            },
+            Value::String(value) => {
+                let index = Self::integer_index(index, instruction_offset, span)?;
+                let characters: Vec<char> = value.chars().collect();
+                let character =
+                    Self::checked_element(&characters, index, false, instruction_offset, span)?;
+                Value::String(character.to_string())
+            }
+            _ => {
+                return Err(VmError::InvalidIndexTarget {
+                    instruction_offset,
+                    target,
+                    assignment: false,
+                    span,
+                })
+            }
+        };
+        self.stack.push(result);
+        Ok(())
+    }
+
+    fn set_index(&mut self, instruction_offset: usize, span: Span) -> Result<(), VmError> {
+        self.require_stack(OpCode::SetIndex, 3, instruction_offset, span)?;
+        let value = self.stack.pop().expect("stack depth was validated");
+        let index = self.stack.pop().expect("stack depth was validated");
+        let target = self.stack.pop().expect("stack depth was validated");
+
+        match &target {
+            Value::Heap(object) => match &mut *object.borrow_mut() {
+                HeapObject::Array(elements) => {
+                    let index = Self::integer_index(index, instruction_offset, span)?;
+                    let length = elements.len();
+                    let element = elements.get_mut(usize::try_from(index).unwrap_or(usize::MAX));
+                    let Some(element) = element else {
+                        return Err(VmError::IndexOutOfBounds {
+                            instruction_offset,
+                            index,
+                            length,
+                            assignment: true,
+                            span,
+                        });
+                    };
+                    *element = value.clone();
+                }
+                HeapObject::Map(entries) => {
+                    let Value::String(key) = index else {
+                        return Err(VmError::InvalidMapKey {
+                            instruction_offset,
+                            key: index,
+                            span,
+                        });
+                    };
+                    entries.insert(key, value.clone());
+                }
+            },
+            _ => {
+                return Err(VmError::InvalidIndexTarget {
+                    instruction_offset,
+                    target,
+                    assignment: true,
+                    span,
+                })
+            }
+        }
+        self.stack.push(value);
+        Ok(())
+    }
+
+    fn require_stack(
+        &self,
+        opcode: OpCode,
+        needed: usize,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let available = self.stack.len();
+        if available < needed {
+            Err(VmError::StackUnderflow {
+                instruction_offset,
+                opcode,
+                needed,
+                available,
+                span,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn integer_index(index: Value, instruction_offset: usize, span: Span) -> Result<i64, VmError> {
+        match index {
+            Value::Int(index) => Ok(index),
+            Value::Float(index) if index.fract() == 0.0 => Ok(index as i64),
+            index => Err(VmError::IndexTypeError {
+                instruction_offset,
+                index,
+                span,
+            }),
+        }
+    }
+
+    fn checked_element<T: Clone>(
+        elements: &[T],
+        index: i64,
+        assignment: bool,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<T, VmError> {
+        elements
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+            .cloned()
+            .ok_or(VmError::IndexOutOfBounds {
+                instruction_offset,
+                index,
+                length: elements.len(),
+                assignment,
+                span,
+            })
     }
 
     fn execute_closure(
@@ -1055,6 +1332,7 @@ impl Vm {
             (Value::Int(left), Value::Float(right)) => *left as f64 == *right,
             (Value::Float(left), Value::Int(right)) => *left == *right as f64,
             (Value::String(left), Value::String(right)) => left == right,
+            (Value::Heap(left), Value::Heap(right)) => Rc::ptr_eq(left, right),
             _ => false,
         }
     }
@@ -1370,8 +1648,8 @@ mod tests {
     use super::{Vm, VmError};
     use crate::error::Span;
     use crate::vm::{
-        Arity, Chunk, ConstantIndex, Function, JumpOffset, LocalSlot, OpCode, UpvalueDescriptor,
-        UpvalueIndex, Value,
+        AggregateCount, Arity, Chunk, ConstantIndex, Function, JumpOffset, LocalSlot, OpCode,
+        UpvalueDescriptor, UpvalueIndex, Value,
     };
 
     const SPAN: Span = Span { line: 1, col: 1 };
@@ -3313,6 +3591,79 @@ mod tests {
                 instruction_pointer: 0,
                 instruction_count: 0,
                 last_span: None,
+            })
+        );
+    }
+
+    #[test]
+    fn build_array_preserves_stack_source_order() {
+        let mut chunk = Chunk::new();
+        for value in [Value::Int(1), Value::Int(2), Value::Int(3)] {
+            let value = chunk.add_constant(value).unwrap();
+            chunk.write_instruction(OpCode::Constant(value), SPAN);
+        }
+        chunk.write_instruction(OpCode::BuildArray(AggregateCount::new(3)), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk).unwrap().to_string(), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn malformed_array_build_reports_stack_underflow() {
+        let chunk = return_chunk(OpCode::BuildArray(AggregateCount::new(2)));
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::StackUnderflow {
+                instruction_offset: 0,
+                opcode: OpCode::BuildArray(AggregateCount::new(2)),
+                needed: 2,
+                available: 0,
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_map_build_reports_stack_underflow() {
+        let chunk = return_chunk(OpCode::BuildMap(AggregateCount::new(1)));
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::StackUnderflow {
+                instruction_offset: 0,
+                opcode: OpCode::BuildMap(AggregateCount::new(1)),
+                needed: 2,
+                available: 0,
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn map_build_rejects_non_string_key_without_panicking() {
+        let mut chunk = Chunk::new();
+        let key = chunk.add_constant(Value::Int(1)).unwrap();
+        let value = chunk.add_constant(Value::Int(2)).unwrap();
+        chunk.write_instruction(OpCode::Constant(key), SPAN);
+        chunk.write_instruction(OpCode::Constant(value), SPAN);
+        chunk.write_instruction(OpCode::BuildMap(AggregateCount::new(1)), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Vm::new().run(&chunk)));
+        assert!(matches!(result, Ok(Err(VmError::InvalidMapKey { .. }))));
+    }
+
+    #[test]
+    fn malformed_set_index_reports_stack_underflow() {
+        let chunk = return_chunk(OpCode::SetIndex);
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::StackUnderflow {
+                instruction_offset: 0,
+                opcode: OpCode::SetIndex,
+                needed: 3,
+                available: 0,
+                span: SPAN,
             })
         );
     }

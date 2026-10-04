@@ -1,5 +1,59 @@
 use std::fmt;
 
+/// Number of array elements or map pairs consumed by a build instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AggregateCount(u16);
+
+impl AggregateCount {
+    pub const MAX: Self = Self(u16::MAX);
+
+    pub const fn new(count: u16) -> Self {
+        Self(count)
+    }
+
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl TryFrom<usize> for AggregateCount {
+    type Error = AggregateCountError;
+
+    fn try_from(count: usize) -> Result<Self, Self::Error> {
+        u16::try_from(count)
+            .map(Self::new)
+            .map_err(|_| AggregateCountError { count })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AggregateCountError {
+    count: usize,
+}
+
+impl AggregateCountError {
+    pub const fn count(self) -> usize {
+        self.count
+    }
+}
+
+impl fmt::Display for AggregateCountError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "aggregate count {} exceeds the maximum supported count {}",
+            self.count,
+            AggregateCount::MAX.as_u16()
+        )
+    }
+}
+
+impl std::error::Error for AggregateCountError {}
+
 /// The number of arguments supplied by a call instruction.
 ///
 /// The explicit byte-sized representation keeps the bytecode operand bounded.
@@ -343,6 +397,10 @@ pub enum OpCode {
     GetUpvalue(UpvalueIndex),
     SetUpvalue(UpvalueIndex),
     CloseUpvalue(LocalSlot),
+    BuildArray(AggregateCount),
+    BuildMap(AggregateCount),
+    GetIndex,
+    SetIndex,
     Call(Arity),
     Return,
 }
@@ -350,8 +408,8 @@ pub enum OpCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arity, ArityError, JumpOffset, JumpOffsetError, LocalSlot, LocalSlotError, UpvalueIndex,
-        UpvalueIndexError,
+        AggregateCount, AggregateCountError, Arity, ArityError, JumpOffset, JumpOffsetError,
+        LocalSlot, LocalSlotError, UpvalueIndex, UpvalueIndexError,
     };
 
     #[test]
@@ -444,5 +502,20 @@ mod tests {
 
         assert_eq!(error, JumpOffsetError { offset: attempted });
         assert_eq!(error.offset(), attempted);
+    }
+
+    #[test]
+    fn constructs_checked_aggregate_count() {
+        let count = AggregateCount::try_from(42_usize).unwrap();
+        assert_eq!(count.as_u16(), 42);
+        assert_eq!(count.as_usize(), 42);
+    }
+
+    #[test]
+    fn rejects_aggregate_count_overflow() {
+        let attempted = usize::from(u16::MAX) + 1;
+        let error = AggregateCount::try_from(attempted).unwrap_err();
+        assert_eq!(error, AggregateCountError { count: attempted });
+        assert_eq!(error.count(), attempted);
     }
 }

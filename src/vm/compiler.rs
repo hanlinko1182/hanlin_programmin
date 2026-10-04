@@ -15,8 +15,8 @@ use crate::ast::{BinOp, Expr, Literal, Program, Stmt, UnOp};
 use crate::error::Span;
 
 use super::{
-    Arity, Chunk, ChunkError, Function, JumpOffset, LocalSlot, OpCode, UpvalueDescriptor,
-    UpvalueIndex, Value,
+    AggregateCount, Arity, Chunk, ChunkError, Function, JumpOffset, LocalSlot, OpCode,
+    UpvalueDescriptor, UpvalueIndex, Value,
 };
 
 const EMPTY_PROGRAM_SPAN: Span = Span { line: 1, col: 1 };
@@ -73,6 +73,16 @@ pub enum CompileError {
     },
     TooManyUpvalues {
         function: String,
+        count: usize,
+        maximum: usize,
+        span: Span,
+    },
+    TooManyArrayElements {
+        count: usize,
+        maximum: usize,
+        span: Span,
+    },
+    TooManyMapEntries {
         count: usize,
         maximum: usize,
         span: Span,
@@ -153,6 +163,22 @@ impl fmt::Display for CompileError {
             } => write!(
                 f,
                 "function '{function}' captures {count} upvalues, exceeding the maximum {maximum} at {span}"
+            ),
+            Self::TooManyArrayElements {
+                count,
+                maximum,
+                span,
+            } => write!(
+                f,
+                "array literal has {count} elements, exceeding the maximum {maximum} at {span}"
+            ),
+            Self::TooManyMapEntries {
+                count,
+                maximum,
+                span,
+            } => write!(
+                f,
+                "object literal has {count} entries, exceeding the maximum {maximum} at {span}"
             ),
             Self::JumpTooLarge { distance, span } => write!(
                 f,
@@ -673,22 +699,81 @@ impl Compiler {
                 }
                 Ok(())
             }
-            Expr::ArrayLiteral { span, .. } => {
-                Err(Self::unsupported_expression("array literal", *span))
+            Expr::ArrayLiteral { elements, span } => {
+                let count = AggregateCount::try_from(elements.len()).map_err(|_| {
+                    CompileError::TooManyArrayElements {
+                        count: elements.len(),
+                        maximum: AggregateCount::MAX.as_usize(),
+                        span: *span,
+                    }
+                })?;
+                for element in elements {
+                    self.compile_expression(chunk, element, *span)?;
+                }
+                chunk.write_instruction(OpCode::BuildArray(count), *span);
+                Ok(())
             }
-            Expr::ObjectLiteral { span, .. } => {
-                Err(Self::unsupported_expression("object literal", *span))
+            Expr::ObjectLiteral { pairs, span } => {
+                let count = AggregateCount::try_from(pairs.len()).map_err(|_| {
+                    CompileError::TooManyMapEntries {
+                        count: pairs.len(),
+                        maximum: AggregateCount::MAX.as_usize(),
+                        span: *span,
+                    }
+                })?;
+                for (key, value) in pairs {
+                    Self::compile_literal(chunk, &Literal::Str(key.clone()), *span)?;
+                    self.compile_expression(chunk, value, *span)?;
+                }
+                chunk.write_instruction(OpCode::BuildMap(count), *span);
+                Ok(())
             }
-            Expr::Index { span, .. } => Err(Self::unsupported_expression("index access", *span)),
-            Expr::Member { span, .. } => Err(Self::unsupported_expression("member access", *span)),
+            Expr::Index {
+                object,
+                index,
+                span,
+            } => {
+                self.compile_expression(chunk, object, *span)?;
+                self.compile_expression(chunk, index, *span)?;
+                chunk.write_instruction(OpCode::GetIndex, *span);
+                Ok(())
+            }
+            Expr::Member {
+                object,
+                property,
+                span,
+            } => {
+                self.compile_expression(chunk, object, *span)?;
+                Self::compile_literal(chunk, &Literal::Str(property.clone()), *span)?;
+                chunk.write_instruction(OpCode::GetIndex, *span);
+                Ok(())
+            }
             Expr::MethodCall { span, .. } => {
                 Err(Self::unsupported_expression("method call", *span))
             }
-            Expr::AssignIndex { span, .. } => {
-                Err(Self::unsupported_expression("index assignment", *span))
+            Expr::AssignIndex {
+                object,
+                index,
+                value,
+                span,
+            } => {
+                self.compile_expression(chunk, object, *span)?;
+                self.compile_expression(chunk, index, *span)?;
+                self.compile_expression(chunk, value, *span)?;
+                chunk.write_instruction(OpCode::SetIndex, *span);
+                Ok(())
             }
-            Expr::AssignMember { span, .. } => {
-                Err(Self::unsupported_expression("member assignment", *span))
+            Expr::AssignMember {
+                object,
+                property,
+                value,
+                span,
+            } => {
+                self.compile_expression(chunk, object, *span)?;
+                Self::compile_literal(chunk, &Literal::Str(property.clone()), *span)?;
+                self.compile_expression(chunk, value, *span)?;
+                chunk.write_instruction(OpCode::SetIndex, *span);
+                Ok(())
             }
             Expr::Call { callee, args } => {
                 let arity =
@@ -2722,24 +2807,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_array_literal_with_its_precise_span() {
+    fn compiles_array_literal_with_its_precise_span() {
+        let chunk = compile_source("let values = [1, 2];").unwrap();
+        assert!(chunk.instructions().iter().any(|instruction| {
+            instruction.opcode() == OpCode::BuildArray(super::AggregateCount::new(2))
+                && instruction.span() == Span::new(1, 14)
+        }));
+    }
+
+    #[test]
+    fn compiles_object_literal() {
         assert_eq!(
-            compile_source("let values = [1, 2];"),
-            Err(CompileError::UnsupportedExpression {
-                kind: "array literal",
-                span: Span::new(1, 14),
-            })
+            run_source_and_get("let result = { value: 1 };", "result").to_string(),
+            "{ value: 1 }"
         );
     }
 
     #[test]
-    fn rejects_object_literal() {
-        assert_unsupported_expression("let result = { value: 1 };", "object literal");
-    }
-
-    #[test]
-    fn rejects_member_access() {
-        assert_unsupported_expression("let result = value.member;", "member access");
+    fn compiles_member_access() {
+        assert_eq!(
+            run_source_and_get(
+                "let value = { member: 7 }; let result = value.member;",
+                "result"
+            ),
+            Value::Int(7)
+        );
     }
 
     #[test]
@@ -2817,5 +2909,326 @@ mod tests {
             run_source_and_get(source, "x").to_string(),
             interpreter_global(source, "x")
         );
+    }
+
+    #[test]
+    fn builds_empty_array() {
+        assert_eq!(
+            run_source_and_get("let result = [];", "result").to_string(),
+            "[]"
+        );
+    }
+
+    #[test]
+    fn builds_integer_array_in_source_order() {
+        assert_eq!(
+            run_source_and_get("let result = [1, 2, 3];", "result").to_string(),
+            "[1, 2, 3]"
+        );
+    }
+
+    #[test]
+    fn builds_mixed_value_array() {
+        assert_eq!(
+            run_source_and_get("let result = [1, \"two\", true, null];", "result").to_string(),
+            "[1, \"two\", true, null]"
+        );
+    }
+
+    #[test]
+    fn builds_nested_array() {
+        assert_eq!(
+            run_source_and_get("let result = [[1], [2, 3]];", "result").to_string(),
+            "[[1], [2, 3]]"
+        );
+    }
+
+    #[test]
+    fn reads_array_index() {
+        assert_eq!(
+            run_source_and_get("let values = [4, 5]; let result = values[1];", "result"),
+            Value::Int(5)
+        );
+    }
+
+    #[test]
+    fn writes_array_index_and_returns_assigned_value() {
+        assert_eq!(
+            run_source_and_get("let values = [1]; let result = values[0] = 9;", "result"),
+            Value::Int(9)
+        );
+        assert_eq!(
+            run_source_and_get(
+                "let values = [1]; values[0] = 9; let result = values;",
+                "result"
+            )
+            .to_string(),
+            "[9]"
+        );
+    }
+
+    #[test]
+    fn array_aliases_share_mutation() {
+        let source = "let a = [1, 2]; let b = a; b[0] = 99; let result = a[0];";
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(99));
+    }
+
+    #[test]
+    fn array_can_be_passed_into_function() {
+        let source = "fn first(values) { return values[0]; } let result = first([8, 9]);";
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(8));
+    }
+
+    #[test]
+    fn array_can_be_returned_from_function() {
+        let source = "fn make() { return [3, 4]; } let result = make();";
+        assert_eq!(run_source_and_get(source, "result").to_string(), "[3, 4]");
+    }
+
+    #[test]
+    fn array_can_be_captured_by_closure() {
+        let source = concat!(
+            "fn make() { let values = [6]; ",
+            "fn get() { return values[0]; } return get; } ",
+            "let get = make(); let result = get();"
+        );
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(6));
+    }
+
+    #[test]
+    fn builds_empty_object() {
+        assert_eq!(
+            run_source_and_get("let result = {};", "result").to_string(),
+            "{  }"
+        );
+    }
+
+    #[test]
+    fn builds_object_with_deterministic_display() {
+        let source = "let result = { name: \"Han\", age: 20 };";
+        assert_eq!(
+            run_source_and_get(source, "result").to_string(),
+            "{ age: 20, name: \"Han\" }"
+        );
+    }
+
+    #[test]
+    fn reads_object_with_string_index() {
+        let source = "let user = { name: \"Han\" }; let result = user[\"name\"];";
+        assert_eq!(
+            run_source_and_get(source, "result"),
+            Value::String("Han".to_owned())
+        );
+    }
+
+    #[test]
+    fn missing_object_key_returns_null() {
+        let source = "let user = {}; let result = user[\"missing\"];";
+        assert_eq!(run_source_and_get(source, "result"), Value::Null);
+    }
+
+    #[test]
+    fn writes_object_with_string_index() {
+        let source = "let user = {}; user[\"name\"] = \"Han\"; let result = user.name;";
+        assert_eq!(
+            run_source_and_get(source, "result"),
+            Value::String("Han".to_owned())
+        );
+    }
+
+    #[test]
+    fn writes_object_member() {
+        let source = "let user = {}; let result = user.name = \"Han\";";
+        assert_eq!(
+            run_source_and_get(source, "result"),
+            Value::String("Han".to_owned())
+        );
+    }
+
+    #[test]
+    fn object_aliases_share_mutation() {
+        let source = "let a = { value: 1 }; let b = a; b.value = 9; let result = a.value;";
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(9));
+    }
+
+    #[test]
+    fn object_can_be_passed_into_function() {
+        let source = "fn name(user) { return user.name; } let result = name({ name: \"Han\" });";
+        assert_eq!(
+            run_source_and_get(source, "result"),
+            Value::String("Han".to_owned())
+        );
+    }
+
+    #[test]
+    fn object_can_be_returned_from_function() {
+        let source = "fn make() { return { value: 7 }; } let result = make();";
+        assert_eq!(
+            run_source_and_get(source, "result").to_string(),
+            "{ value: 7 }"
+        );
+    }
+
+    #[test]
+    fn object_can_be_captured_by_closure() {
+        let source = concat!(
+            "fn make() { let user = { name: \"Han\" }; ",
+            "fn get() { return user.name; } return get; } ",
+            "let get = make(); let result = get();"
+        );
+        assert_eq!(
+            run_source_and_get(source, "result"),
+            Value::String("Han".to_owned())
+        );
+    }
+
+    #[test]
+    fn invalid_array_index_type_is_structured_error() {
+        assert!(matches!(
+            run_source_result("let values = [1]; values[\"zero\"];"),
+            Err(VmError::IndexTypeError { .. })
+        ));
+    }
+
+    #[test]
+    fn array_out_of_bounds_is_structured_error() {
+        assert!(matches!(
+            run_source_result("let values = [1]; values[2];"),
+            Err(VmError::IndexOutOfBounds { index: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn indexing_non_indexable_value_is_structured_error() {
+        assert!(matches!(
+            run_source_result("let value = 7; value[0];"),
+            Err(VmError::InvalidIndexTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_map_key_is_structured_error() {
+        assert!(matches!(
+            run_source_result("let value = {}; value[0];"),
+            Err(VmError::InvalidMapKey { .. })
+        ));
+    }
+
+    #[test]
+    fn vm_is_reusable_after_indexing_error() {
+        let bad = compile_source("let values = [1]; values[2];").unwrap();
+        let good = compile_source("let answer = 42;").unwrap();
+        let mut vm = Vm::new();
+        assert!(matches!(
+            vm.run(&bad),
+            Err(VmError::IndexOutOfBounds { .. })
+        ));
+        assert_eq!(vm.run(&good), Ok(Value::Null));
+        assert_eq!(read_global(&mut vm, "answer"), Value::Int(42));
+    }
+
+    #[test]
+    fn aggregates_are_truthy_even_when_empty() {
+        let source = concat!(
+            "let arrays = false; let maps = false; ",
+            "if ([]) { arrays = true; } if ({}) { maps = true; } ",
+            "let result = arrays && maps;"
+        );
+        assert_eq!(run_source_and_get(source, "result"), Value::Bool(true));
+    }
+
+    #[test]
+    fn aggregate_equality_uses_identity() {
+        let source = concat!(
+            "let a = []; let alias = a; let other = []; ",
+            "let result = a == alias && a != other;"
+        );
+        assert_eq!(run_source_and_get(source, "result"), Value::Bool(true));
+    }
+
+    #[test]
+    fn nested_aggregate_mutation_is_shared() {
+        let source =
+            "let outer = [[1]]; let alias = outer[0]; alias[0] = 9; let result = outer[0][0];";
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(9));
+    }
+
+    #[test]
+    fn vm_matches_interpreter_for_array_behavior() {
+        let source = "let values = [1, 2]; values[1] = 9; let result = values;";
+        assert_eq!(
+            run_source_and_get(source, "result").to_string(),
+            interpreter_global(source, "result")
+        );
+    }
+
+    #[test]
+    fn vm_matches_interpreter_for_object_behavior() {
+        let source = "let user = { name: \"Han\" }; user.age = 20; let result = user;";
+        assert_eq!(
+            run_source_and_get(source, "result").to_string(),
+            interpreter_global(source, "result")
+        );
+    }
+
+    #[test]
+    fn vm_matches_interpreter_for_aggregate_alias_mutation() {
+        let source = "let a = { value: 1 }; let b = a; b.value = 5; let result = a.value;";
+        assert_eq!(
+            run_source_and_get(source, "result").to_string(),
+            interpreter_global(source, "result")
+        );
+    }
+
+    #[test]
+    fn method_calls_remain_explicitly_unsupported() {
+        assert_unsupported_expression("let values = []; values.push(1);", "method call");
+    }
+
+    #[test]
+    fn excessive_array_element_count_is_compile_error() {
+        let span = Span::new(1, 1);
+        let expression = crate::ast::Expr::ArrayLiteral {
+            elements: vec![
+                crate::ast::Expr::Literal(crate::ast::Literal::Null);
+                super::AggregateCount::MAX.as_usize() + 1
+            ],
+            span,
+        };
+        let program = crate::ast::Program::new(vec![crate::ast::Stmt::Expression {
+            expr: expression,
+            span,
+        }]);
+
+        assert!(matches!(
+            Compiler::new().compile(&program),
+            Err(CompileError::TooManyArrayElements { count, .. })
+                if count == super::AggregateCount::MAX.as_usize() + 1
+        ));
+    }
+
+    #[test]
+    fn excessive_map_entry_count_is_compile_error() {
+        let span = Span::new(1, 1);
+        let expression = crate::ast::Expr::ObjectLiteral {
+            pairs: vec![
+                (
+                    "key".to_owned(),
+                    crate::ast::Expr::Literal(crate::ast::Literal::Null)
+                );
+                super::AggregateCount::MAX.as_usize() + 1
+            ],
+            span,
+        };
+        let program = crate::ast::Program::new(vec![crate::ast::Stmt::Expression {
+            expr: expression,
+            span,
+        }]);
+
+        assert!(matches!(
+            Compiler::new().compile(&program),
+            Err(CompileError::TooManyMapEntries { count, .. })
+                if count == super::AggregateCount::MAX.as_usize() + 1
+        ));
     }
 }

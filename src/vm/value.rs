@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::rc::Rc;
 
-use super::{Closure, Function};
+use super::{Closure, Function, HeapObject, HeapObjectRef};
 
 /// A runtime value suitable for storage in VM bytecode constant pools.
 ///
@@ -9,7 +10,7 @@ use super::{Closure, Function};
 /// The tree-walking interpreter stores environments, functions, and shared
 /// mutable collections, while the VM uses compiled functions and closures with
 /// shared upvalue storage.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -20,6 +21,8 @@ pub enum Value {
     Function(Rc<Function>),
     /// Callable runtime function paired with captured lexical state.
     Closure(Rc<Closure>),
+    /// Shared mutable aggregate allocated in the VM heap-object model.
+    Heap(HeapObjectRef),
 }
 
 impl PartialEq for Value {
@@ -32,6 +35,7 @@ impl PartialEq for Value {
             (Self::String(left), Self::String(right)) => left == right,
             (Self::Function(left), Self::Function(right)) => Rc::ptr_eq(left, right),
             (Self::Closure(left), Self::Closure(right)) => Rc::ptr_eq(left, right),
+            (Self::Heap(left), Self::Heap(right)) => Rc::ptr_eq(left, right),
             _ => false,
         }
     }
@@ -49,29 +53,98 @@ impl Value {
             Self::String(value) => !value.is_empty(),
             Self::Function(_) => true,
             Self::Closure(_) => true,
+            Self::Heap(_) => true,
+        }
+    }
+
+    pub fn array(elements: Vec<Self>) -> Self {
+        Self::Heap(HeapObject::array(elements))
+    }
+
+    pub fn map(entries: std::collections::HashMap<String, Self>) -> Self {
+        Self::Heap(HeapObject::map(entries))
+    }
+
+    fn fmt_with(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        quote_string: bool,
+        active: &mut HashSet<*const std::cell::RefCell<HeapObject>>,
+    ) -> fmt::Result {
+        match self {
+            Self::Null => write!(f, "null"),
+            Self::Bool(value) => write!(f, "{value}"),
+            Self::Int(value) => write!(f, "{value}"),
+            Self::Float(value) => write!(f, "{value}"),
+            Self::String(value) if quote_string => write!(f, "\"{value}\""),
+            Self::String(value) => write!(f, "{value}"),
+            Self::Function(function) => write!(f, "<fn {}>", function.name()),
+            Self::Closure(closure) => write!(f, "<fn {}>", closure.function().name()),
+            Self::Heap(object) => {
+                let pointer = Rc::as_ptr(object);
+                if !active.insert(pointer) {
+                    return write!(f, "<cycle>");
+                }
+                let object = object.borrow();
+                let result = match &*object {
+                    HeapObject::Array(elements) => {
+                        write!(f, "[")?;
+                        for (index, value) in elements.iter().enumerate() {
+                            if index > 0 {
+                                write!(f, ", ")?;
+                            }
+                            value.fmt_with(f, true, active)?;
+                        }
+                        write!(f, "]")
+                    }
+                    HeapObject::Map(entries) => {
+                        let mut entries: Vec<_> = entries.iter().collect();
+                        entries.sort_by_key(|(key, _)| *key);
+                        write!(f, "{{ ")?;
+                        for (index, (key, value)) in entries.into_iter().enumerate() {
+                            if index > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{key}: ")?;
+                            value.fmt_with(f, true, active)?;
+                        }
+                        write!(f, " }}")
+                    }
+                };
+                active.remove(&pointer);
+                result
+            }
         }
     }
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_with(f, false, &mut HashSet::new())
+    }
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Null => write!(f, "null"),
-            Self::Bool(value) => write!(f, "{value}"),
-            Self::Int(value) => write!(f, "{value}"),
-            Self::Float(value) => write!(f, "{value}"),
-            Self::String(value) => write!(f, "{value}"),
-            Self::Function(function) => write!(f, "<fn {}>", function.name()),
-            Self::Closure(closure) => write!(f, "<fn {}>", closure.function().name()),
+            Self::Null => write!(f, "Null"),
+            Self::Bool(value) => f.debug_tuple("Bool").field(value).finish(),
+            Self::Int(value) => f.debug_tuple("Int").field(value).finish(),
+            Self::Float(value) => f.debug_tuple("Float").field(value).finish(),
+            Self::String(value) => f.debug_tuple("String").field(value).finish(),
+            Self::Function(function) => f.debug_tuple("Function").field(function).finish(),
+            Self::Closure(closure) => f.debug_tuple("Closure").field(closure).finish(),
+            Self::Heap(_) => write!(f, "Heap({self})"),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::rc::Rc;
 
-    use super::Value;
+    use super::{HeapObject, Value};
     use crate::vm::{Arity, Chunk, Closure, Function};
 
     #[test]
@@ -144,5 +217,47 @@ mod tests {
         assert_eq!(original, same);
         assert_ne!(original, distinct);
         assert!(original.is_truthy());
+    }
+
+    #[test]
+    fn aggregate_values_use_identity_equality_and_are_truthy() {
+        let original = Value::array(Vec::new());
+        let same = original.clone();
+        let distinct = Value::array(Vec::new());
+
+        assert_eq!(original, same);
+        assert_ne!(original, distinct);
+        assert!(original.is_truthy());
+        assert!(Value::map(HashMap::new()).is_truthy());
+    }
+
+    #[test]
+    fn aggregate_display_is_nested_and_deterministic() {
+        let mut entries = HashMap::new();
+        entries.insert("name".to_owned(), Value::String("Han".to_owned()));
+        entries.insert(
+            "items".to_owned(),
+            Value::array(vec![Value::Int(1), Value::Bool(true)]),
+        );
+        let value = Value::map(entries);
+
+        assert_eq!(value.to_string(), "{ items: [1, true], name: \"Han\" }");
+        assert_eq!(value.to_string(), value.to_string());
+    }
+
+    #[test]
+    fn aggregate_display_handles_reference_cycles() {
+        let value = Value::array(vec![Value::Null]);
+        let Value::Heap(object) = &value else {
+            unreachable!()
+        };
+        let mut object = object.borrow_mut();
+        let HeapObject::Array(elements) = &mut *object else {
+            unreachable!()
+        };
+        elements[0] = value.clone();
+        drop(object);
+
+        assert_eq!(value.to_string(), "[<cycle>]");
     }
 }
