@@ -14,5 +14,5 @@ pub mod value;
 pub use chunk::{Chunk, ChunkError, Instruction};
 pub use disassembler::{disassemble_chunk, disassemble_instruction, DisassembleError};
 pub use machine::{Vm, VmError};
-pub use opcode::{ConstantIndex, OpCode};
+pub use opcode::{ConstantIndex, LocalSlot, LocalSlotError, OpCode};
 pub use value::Value;

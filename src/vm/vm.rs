@@ -11,7 +11,7 @@ use std::fmt;
 
 use crate::error::Span;
 
-use super::{Chunk, OpCode, Value};
+use super::{Chunk, LocalSlot, OpCode, Value};
 
 /// A structured failure encountered while executing Hanlin bytecode.
 #[derive(Clone, Debug, PartialEq)]
@@ -57,6 +57,12 @@ pub enum VmError {
     IntegerOverflow {
         instruction_offset: usize,
         opcode: OpCode,
+        span: Span,
+    },
+    InvalidLocalSlot {
+        instruction_offset: usize,
+        slot: LocalSlot,
+        stack_len: usize,
         span: Span,
     },
     InvalidGlobalName {
@@ -153,6 +159,16 @@ impl fmt::Display for VmError {
             } => write!(
                 f,
                 "integer overflow while executing {opcode:?} at instruction {instruction_offset} ({span})"
+            ),
+            Self::InvalidLocalSlot {
+                instruction_offset,
+                slot,
+                stack_len,
+                span,
+            } => write!(
+                f,
+                "local slot {} is invalid for a stack with {stack_len} values at instruction {instruction_offset} ({span})",
+                slot.as_u16()
             ),
             Self::InvalidGlobalName {
                 instruction_offset,
@@ -268,6 +284,12 @@ impl Vm {
                     self.execute_comparison(opcode, instruction_offset, span)?;
                 }
                 OpCode::Not => self.execute_not(instruction_offset, span)?,
+                OpCode::GetLocal(slot) => {
+                    self.get_local(slot, instruction_offset, span)?;
+                }
+                OpCode::SetLocal(slot) => {
+                    self.set_local(slot, instruction_offset, span)?;
+                }
                 OpCode::DefineGlobal(index) => {
                     self.define_global(chunk, index, instruction_offset, span)?;
                 }
@@ -589,6 +611,62 @@ impl Vm {
         })
     }
 
+    fn get_local(
+        &mut self,
+        slot: LocalSlot,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let stack_index = self.resolve_local_index(slot, instruction_offset, span)?;
+        let value = self.stack[stack_index].clone();
+        self.stack.push(value);
+        Ok(())
+    }
+
+    fn set_local(
+        &mut self,
+        slot: LocalSlot,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let stack_index = self.resolve_local_index(slot, instruction_offset, span)?;
+        let value = self
+            .stack
+            .last()
+            .cloned()
+            .ok_or(VmError::InvalidLocalSlot {
+                instruction_offset,
+                slot,
+                stack_len: self.stack.len(),
+                span,
+            })?;
+        self.stack[stack_index] = value;
+        Ok(())
+    }
+
+    /// Resolves a frame-relative local slot to its absolute stack index.
+    ///
+    /// VM-07 has a single implicit frame starting at zero. Future call frames
+    /// can supply a different base here without changing either local opcode.
+    fn resolve_local_index(
+        &self,
+        slot: LocalSlot,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<usize, VmError> {
+        let frame_base = 0usize;
+        let stack_len = self.stack.len();
+        frame_base
+            .checked_add(slot.as_usize())
+            .filter(|&stack_index| stack_index < stack_len)
+            .ok_or(VmError::InvalidLocalSlot {
+                instruction_offset,
+                slot,
+                stack_len,
+                span,
+            })
+    }
+
     fn define_global(
         &mut self,
         chunk: &Chunk,
@@ -692,7 +770,7 @@ impl Default for Vm {
 mod tests {
     use super::{Vm, VmError};
     use crate::error::Span;
-    use crate::vm::{Chunk, ConstantIndex, OpCode, Value};
+    use crate::vm::{Chunk, ConstantIndex, LocalSlot, OpCode, Value};
 
     const SPAN: Span = Span { line: 1, col: 1 };
 
@@ -768,6 +846,15 @@ mod tests {
         chunk.write_instruction(OpCode::Constant(value), SPAN);
         chunk.write_instruction(OpCode::SetGlobal(name), SPAN);
         chunk.write_instruction(OpCode::Return, SPAN);
+        chunk
+    }
+
+    fn chunk_with_stack_values(values: &[Value]) -> Chunk {
+        let mut chunk = Chunk::new();
+        for value in values {
+            let index = chunk.add_constant(value.clone()).unwrap();
+            chunk.write_instruction(OpCode::Constant(index), SPAN);
+        }
         chunk
     }
 
@@ -1836,6 +1923,253 @@ mod tests {
             })
         );
         assert_eq!(vm.run(&get_global_chunk("x")), Ok(Value::Int(10)));
+    }
+
+    #[test]
+    fn gets_local_slot_zero() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(10), Value::Int(20)]);
+        chunk.write_instruction(OpCode::GetLocal(LocalSlot::new(0)), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(10)));
+    }
+
+    #[test]
+    fn gets_nonzero_local_slot() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(10), Value::Int(20)]);
+        chunk.write_instruction(OpCode::GetLocal(LocalSlot::new(1)), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(20)));
+    }
+
+    #[test]
+    fn get_local_clones_without_removing_original() {
+        let mut chunk = chunk_with_stack_values(&[Value::String("local".to_owned())]);
+        chunk.write_instruction(OpCode::GetLocal(LocalSlot::new(0)), SPAN);
+        chunk.write_instruction(OpCode::Pop, SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::String("local".to_owned())));
+    }
+
+    #[test]
+    fn sets_local_slot_zero() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(10), Value::Int(99)]);
+        chunk.write_instruction(OpCode::SetLocal(LocalSlot::new(0)), SPAN);
+        chunk.write_instruction(OpCode::Pop, SPAN);
+        chunk.write_instruction(OpCode::GetLocal(LocalSlot::new(0)), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(99)));
+    }
+
+    #[test]
+    fn sets_nonzero_local_slot() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(10), Value::Int(20), Value::Int(99)]);
+        chunk.write_instruction(OpCode::SetLocal(LocalSlot::new(1)), SPAN);
+        chunk.write_instruction(OpCode::Pop, SPAN);
+        chunk.write_instruction(OpCode::GetLocal(LocalSlot::new(1)), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(99)));
+    }
+
+    #[test]
+    fn set_local_leaves_assigned_value_on_top() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(10), Value::Int(99)]);
+        chunk.write_instruction(OpCode::SetLocal(LocalSlot::new(0)), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(99)));
+    }
+
+    #[test]
+    fn set_local_updates_only_target_slot() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(10), Value::Int(20), Value::Int(99)]);
+        chunk.write_instruction(OpCode::SetLocal(LocalSlot::new(0)), SPAN);
+        chunk.write_instruction(OpCode::Pop, SPAN);
+        chunk.write_instruction(OpCode::GetLocal(LocalSlot::new(1)), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(20)));
+    }
+
+    #[test]
+    fn invalid_get_local_returns_slot_error() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(10)]);
+        let span = Span::new(4, 7);
+        let slot = LocalSlot::new(1);
+        chunk.write_instruction(OpCode::GetLocal(slot), span);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidLocalSlot {
+                instruction_offset: 1,
+                slot,
+                stack_len: 1,
+                span,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_set_local_returns_slot_error_without_growing_stack() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(10)]);
+        let span = Span::new(5, 8);
+        let slot = LocalSlot::new(1);
+        chunk.write_instruction(OpCode::SetLocal(slot), span);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidLocalSlot {
+                instruction_offset: 1,
+                slot,
+                stack_len: 1,
+                span,
+            })
+        );
+    }
+
+    #[test]
+    fn empty_stack_local_access_returns_slot_error() {
+        for opcode in [
+            OpCode::GetLocal(LocalSlot::new(0)),
+            OpCode::SetLocal(LocalSlot::new(0)),
+        ] {
+            let mut chunk = Chunk::new();
+            chunk.write_instruction(opcode, SPAN);
+
+            assert_eq!(
+                Vm::new().run(&chunk),
+                Err(VmError::InvalidLocalSlot {
+                    instruction_offset: 0,
+                    slot: LocalSlot::new(0),
+                    stack_len: 0,
+                    span: SPAN,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn locals_work_with_arithmetic_temporaries() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(10), Value::Int(20)]);
+        chunk.write_instruction(OpCode::GetLocal(LocalSlot::new(0)), SPAN);
+        chunk.write_instruction(OpCode::Add, SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(30)));
+    }
+
+    #[test]
+    fn globals_and_locals_remain_independent() {
+        let mut chunk = Chunk::new();
+        let name = chunk.add_constant(Value::String("x".to_owned())).unwrap();
+        let global = chunk.add_constant(Value::Int(100)).unwrap();
+        let local = chunk.add_constant(Value::Int(10)).unwrap();
+        chunk.write_instruction(OpCode::Constant(global), SPAN);
+        chunk.write_instruction(OpCode::DefineGlobal(name), SPAN);
+        chunk.write_instruction(OpCode::Constant(local), SPAN);
+        chunk.write_instruction(OpCode::GetGlobal(name), SPAN);
+        chunk.write_instruction(OpCode::GetLocal(LocalSlot::new(0)), SPAN);
+        chunk.write_instruction(OpCode::Add, SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        let mut vm = Vm::new();
+        assert_eq!(vm.run(&chunk), Ok(Value::Int(110)));
+        assert_eq!(vm.run(&get_global_chunk("x")), Ok(Value::Int(100)));
+    }
+
+    #[test]
+    fn globals_persist_while_local_runs_reset() {
+        let mut vm = Vm::new();
+        vm.run(&define_global_chunk("x", Value::Int(7))).unwrap();
+
+        let mut local = chunk_with_stack_values(&[Value::Int(99)]);
+        local.write_instruction(OpCode::GetLocal(LocalSlot::new(0)), SPAN);
+        local.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(vm.run(&local), Ok(Value::Int(99)));
+        assert_eq!(vm.run(&get_global_chunk("x")), Ok(Value::Int(7)));
+    }
+
+    #[test]
+    fn locals_do_not_persist_across_runs() {
+        let mut vm = Vm::new();
+        assert_eq!(vm.run(&constant_chunk(Value::Int(10))), Ok(Value::Int(10)));
+
+        let mut get_previous_local = Chunk::new();
+        get_previous_local.write_instruction(OpCode::GetLocal(LocalSlot::new(0)), SPAN);
+        assert_eq!(
+            vm.run(&get_previous_local),
+            Err(VmError::InvalidLocalSlot {
+                instruction_offset: 0,
+                slot: LocalSlot::new(0),
+                stack_len: 0,
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn vm_is_reusable_after_invalid_local_error() {
+        let mut invalid = Chunk::new();
+        invalid.write_instruction(OpCode::GetLocal(LocalSlot::new(3)), SPAN);
+
+        let mut valid = chunk_with_stack_values(&[Value::Int(42)]);
+        valid.write_instruction(OpCode::GetLocal(LocalSlot::new(0)), SPAN);
+        valid.write_instruction(OpCode::Return, SPAN);
+
+        let mut vm = Vm::new();
+        assert!(matches!(
+            vm.run(&invalid),
+            Err(VmError::InvalidLocalSlot { .. })
+        ));
+        assert_eq!(vm.run(&valid), Ok(Value::Int(42)));
+        assert!(vm.stack.is_empty());
+        assert_eq!(vm.instruction_pointer, 0);
+    }
+
+    #[test]
+    fn maximum_local_slot_is_checked_at_runtime() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(1)]);
+        chunk.write_instruction(OpCode::GetLocal(LocalSlot::MAX), SPAN);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidLocalSlot {
+                instruction_offset: 1,
+                slot: LocalSlot::MAX,
+                stack_len: 1,
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_local_access_does_not_panic() {
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(OpCode::SetLocal(LocalSlot::MAX), SPAN);
+
+        let result = std::panic::catch_unwind(|| Vm::new().run(&chunk));
+        assert!(matches!(
+            result,
+            Ok(Err(VmError::InvalidLocalSlot {
+                slot: LocalSlot::MAX,
+                stack_len: 0,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn get_local_followed_by_return_yields_local_value() {
+        let mut chunk = chunk_with_stack_values(&[Value::Bool(true)]);
+        chunk.write_instruction(OpCode::GetLocal(LocalSlot::new(0)), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Bool(true)));
     }
 
     #[test]

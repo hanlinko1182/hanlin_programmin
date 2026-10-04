@@ -6,7 +6,7 @@
 use std::fmt;
 use std::fmt::Write;
 
-use super::{Chunk, ConstantIndex, OpCode, Value};
+use super::{Chunk, ConstantIndex, LocalSlot, OpCode, Value};
 
 /// An error found while disassembling a bytecode chunk.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,8 +86,15 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> Result<String, D
         OpCode::DefineGlobal(index) | OpCode::GetGlobal(index) | OpCode::SetGlobal(index) => {
             format_indexed_instruction(chunk, offset, &span, name, index, true)
         }
+        OpCode::GetLocal(slot) | OpCode::SetLocal(slot) => {
+            Ok(format_local_instruction(offset, &span, name, slot))
+        }
         _ => Ok(format!("{offset:04}  {span:<6} {name}")),
     }
+}
+
+fn format_local_instruction(offset: usize, span: &str, name: &str, slot: LocalSlot) -> String {
+    format!("{offset:04}  {span:<6} {name:<14} {}", slot.as_u16())
 }
 
 fn format_indexed_instruction(
@@ -139,6 +146,8 @@ fn opcode_name(opcode: OpCode) -> &'static str {
         OpCode::LessEqual => "LESS_EQUAL",
         OpCode::Greater => "GREATER",
         OpCode::GreaterEqual => "GREATER_EQUAL",
+        OpCode::GetLocal(_) => "GET_LOCAL",
+        OpCode::SetLocal(_) => "SET_LOCAL",
         OpCode::DefineGlobal(_) => "DEFINE_GLOBAL",
         OpCode::GetGlobal(_) => "GET_GLOBAL",
         OpCode::SetGlobal(_) => "SET_GLOBAL",
@@ -160,7 +169,7 @@ fn format_constant(value: &Value) -> String {
 mod tests {
     use super::{disassemble_chunk, disassemble_instruction, DisassembleError};
     use crate::error::Span;
-    use crate::vm::{Chunk, ConstantIndex, OpCode, Value};
+    use crate::vm::{Chunk, ConstantIndex, LocalSlot, OpCode, Value};
 
     fn chunk_with(opcodes: &[OpCode]) -> Chunk {
         let mut chunk = Chunk::new();
@@ -381,6 +390,28 @@ mod tests {
         assert_eq!(
             disassemble_instruction(&chunk, 0).unwrap(),
             "0000  3:1    SET_GLOBAL     0    \"answer\""
+        );
+    }
+
+    #[test]
+    fn disassembles_get_local_without_constant_lookup() {
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(OpCode::GetLocal(LocalSlot::new(0)), Span::new(1, 1));
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0).unwrap(),
+            "0000  1:1    GET_LOCAL      0"
+        );
+    }
+
+    #[test]
+    fn disassembles_set_local_without_constant_lookup() {
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(OpCode::SetLocal(LocalSlot::new(1)), Span::new(1, 5));
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0).unwrap(),
+            "0000  1:5    SET_LOCAL      1"
         );
     }
 
