@@ -1,9 +1,9 @@
 //! AST-to-bytecode compiler for Hanlin's stack VM.
 //!
-//! The compiler supports primitive expressions, top-level globals, and the
-//! initial control-flow subset. Supported expression nodes do not carry source
-//! spans in the current AST, so their containing statement's span is applied
-//! to every instruction they emit. An empty program uses
+//! The compiler supports primitive expressions, top-level globals, control
+//! flow, and short-circuit logical expressions. Supported expression nodes do
+//! not carry source spans in the current AST, so their containing statement's
+//! span is applied to every instruction they emit. An empty program uses
 //! [`EMPTY_PROGRAM_SPAN`] for its synthetic `Null` and `Return` instructions.
 
 use std::fmt;
@@ -369,7 +369,16 @@ impl Compiler {
                 Ok(())
             }
             Expr::Binary { op, left, right } => {
-                let opcode = Self::binary_opcode(*op, fallback_span)?;
+                match op {
+                    BinOp::And => {
+                        return Self::compile_logical_and(chunk, left, right, fallback_span);
+                    }
+                    BinOp::Or => {
+                        return Self::compile_logical_or(chunk, left, right, fallback_span);
+                    }
+                    _ => {}
+                }
+                let opcode = Self::binary_opcode(*op);
                 Self::compile_expression(chunk, left, fallback_span)?;
                 Self::compile_expression(chunk, right, fallback_span)?;
                 chunk.write_instruction(opcode, fallback_span);
@@ -402,6 +411,35 @@ impl Compiler {
         }
     }
 
+    fn compile_logical_and(
+        chunk: &mut Chunk,
+        left: &Expr,
+        right: &Expr,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        Self::compile_expression(chunk, left, span)?;
+        let end_jump = Self::emit_jump(chunk, true, span);
+        chunk.write_instruction(OpCode::Pop, span);
+        Self::compile_expression(chunk, right, span)?;
+        Self::patch_jump(chunk, end_jump, chunk.instructions().len(), span)
+    }
+
+    fn compile_logical_or(
+        chunk: &mut Chunk,
+        left: &Expr,
+        right: &Expr,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        Self::compile_expression(chunk, left, span)?;
+        let right_jump = Self::emit_jump(chunk, true, span);
+        let end_jump = Self::emit_jump(chunk, false, span);
+
+        Self::patch_jump(chunk, right_jump, chunk.instructions().len(), span)?;
+        chunk.write_instruction(OpCode::Pop, span);
+        Self::compile_expression(chunk, right, span)?;
+        Self::patch_jump(chunk, end_jump, chunk.instructions().len(), span)
+    }
+
     fn compile_literal(
         chunk: &mut Chunk,
         literal: &Literal,
@@ -427,21 +465,22 @@ impl Compiler {
         Ok(())
     }
 
-    fn binary_opcode(operator: BinOp, span: Span) -> Result<OpCode, CompileError> {
+    fn binary_opcode(operator: BinOp) -> OpCode {
         match operator {
-            BinOp::Add => Ok(OpCode::Add),
-            BinOp::Sub => Ok(OpCode::Subtract),
-            BinOp::Mul => Ok(OpCode::Multiply),
-            BinOp::Div => Ok(OpCode::Divide),
-            BinOp::Mod => Ok(OpCode::Modulo),
-            BinOp::EqEq => Ok(OpCode::Equal),
-            BinOp::NotEq => Ok(OpCode::NotEqual),
-            BinOp::Lt => Ok(OpCode::Less),
-            BinOp::LtEq => Ok(OpCode::LessEqual),
-            BinOp::Gt => Ok(OpCode::Greater),
-            BinOp::GtEq => Ok(OpCode::GreaterEqual),
-            BinOp::And => Err(Self::unsupported_expression("logical And", span)),
-            BinOp::Or => Err(Self::unsupported_expression("logical Or", span)),
+            BinOp::Add => OpCode::Add,
+            BinOp::Sub => OpCode::Subtract,
+            BinOp::Mul => OpCode::Multiply,
+            BinOp::Div => OpCode::Divide,
+            BinOp::Mod => OpCode::Modulo,
+            BinOp::EqEq => OpCode::Equal,
+            BinOp::NotEq => OpCode::NotEqual,
+            BinOp::Lt => OpCode::Less,
+            BinOp::LtEq => OpCode::LessEqual,
+            BinOp::Gt => OpCode::Greater,
+            BinOp::GtEq => OpCode::GreaterEqual,
+            BinOp::And | BinOp::Or => {
+                unreachable!("logical operators are lowered with short-circuit control flow")
+            }
         }
     }
 
@@ -1144,6 +1183,276 @@ mod tests {
     }
 
     #[test]
+    fn compiles_true_and_true() {
+        assert_eq!(
+            run_source_and_get("let result = true && true;", "result"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn compiles_true_and_false() {
+        assert_eq!(
+            run_source_and_get("let result = true && false;", "result"),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn compiles_false_and_true() {
+        assert_eq!(
+            run_source_and_get("let result = false && true;", "result"),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn compiles_false_and_false() {
+        assert_eq!(
+            run_source_and_get("let result = false && false;", "result"),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn compiles_true_or_true() {
+        assert_eq!(
+            run_source_and_get("let result = true || true;", "result"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn compiles_true_or_false() {
+        assert_eq!(
+            run_source_and_get("let result = true || false;", "result"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn compiles_false_or_true() {
+        assert_eq!(
+            run_source_and_get("let result = false || true;", "result"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn compiles_false_or_false() {
+        assert_eq!(
+            run_source_and_get("let result = false || false;", "result"),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn logical_and_preserves_zero_left_operand() {
+        assert_eq!(
+            run_source_and_get("let result = 0 && 42;", "result"),
+            Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn logical_and_returns_right_operand_for_truthy_nonzero_left() {
+        assert_eq!(
+            run_source_and_get("let result = 2 && 42;", "result"),
+            Value::Int(42)
+        );
+    }
+
+    #[test]
+    fn logical_or_returns_fallback_for_empty_string() {
+        assert_eq!(
+            run_source_and_get("let result = \"\" || \"fallback\";", "result"),
+            Value::String("fallback".to_owned())
+        );
+    }
+
+    #[test]
+    fn logical_or_preserves_non_empty_string_left_operand() {
+        assert_eq!(
+            run_source_and_get("let result = \"left\" || \"fallback\";", "result"),
+            Value::String("left".to_owned())
+        );
+    }
+
+    #[test]
+    fn false_and_skips_assignment_rhs() {
+        assert_eq!(
+            run_source_and_get("let x = 0; false && (x = 1);", "x"),
+            Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn true_or_skips_assignment_rhs() {
+        assert_eq!(
+            run_source_and_get("let x = 0; true || (x = 1);", "x"),
+            Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn true_and_evaluates_assignment_rhs() {
+        assert_eq!(
+            run_source_and_get("let x = 0; true && (x = 1);", "x"),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn false_or_evaluates_assignment_rhs() {
+        assert_eq!(
+            run_source_and_get("let x = 0; false || (x = 1);", "x"),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn compiles_chained_logical_and() {
+        assert_eq!(
+            run_source_and_get("let result = true && true && false;", "result"),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn compiles_chained_logical_or() {
+        assert_eq!(
+            run_source_and_get("let result = false || true || false;", "result"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn compiles_mixed_logical_operators() {
+        assert_eq!(
+            run_source_and_get("let result = false || \"yes\" && 7;", "result"),
+            Value::Int(7)
+        );
+    }
+
+    #[test]
+    fn compiles_parenthesized_logical_expression() {
+        assert_eq!(
+            run_source_and_get("let result = (true && false) || \"done\";", "result"),
+            Value::String("done".to_owned())
+        );
+    }
+
+    #[test]
+    fn logical_compilation_preserves_parser_precedence() {
+        assert_eq!(
+            run_source_and_get("let result = true || false && false;", "result"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn logical_expression_statement_remains_stack_balanced() {
+        let source = "let x = 0; false || 5; x = x + 1;";
+
+        assert_eq!(run_source_and_get(source, "x"), Value::Int(1));
+        assert_eq!(run_source(source), Value::Null);
+    }
+
+    #[test]
+    fn logical_expression_works_as_if_condition() {
+        assert_eq!(
+            run_source_and_get("let x = 0; if (0 || \"go\") { x = 1; }", "x"),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn logical_expression_works_as_while_condition() {
+        let source = "let x = 0; while (x < 3 && true) { x = x + 1; }";
+
+        assert_eq!(run_source_and_get(source, "x"), Value::Int(3));
+    }
+
+    #[test]
+    fn vm_is_reusable_after_compiled_logical_expressions() {
+        let first = compile_source("let x = false || 1;").unwrap();
+        let second = compile_source("let y = true && 2;").unwrap();
+        let mut vm = Vm::new();
+
+        assert_eq!(vm.run(&first), Ok(Value::Null));
+        assert_eq!(vm.run(&second), Ok(Value::Null));
+        assert_eq!(read_global(&mut vm, "x"), Value::Int(1));
+        assert_eq!(read_global(&mut vm, "y"), Value::Int(2));
+    }
+
+    #[test]
+    fn logical_and_disassembly_has_patched_valid_target() {
+        let chunk = compile_source("let result = false && true;").unwrap();
+        let output = disassemble_chunk(&chunk, "and").unwrap();
+
+        assert!(output.contains("JUMP_IF_FALSE    2 -> 4"));
+    }
+
+    #[test]
+    fn logical_or_disassembly_has_patched_valid_targets() {
+        let chunk = compile_source("let result = true || false;").unwrap();
+        let output = disassemble_chunk(&chunk, "or").unwrap();
+
+        assert!(output.contains("JUMP_IF_FALSE    1 -> 3"));
+        assert!(output.contains("JUMP             2 -> 5"));
+    }
+
+    #[test]
+    fn logical_expression_disassembly_is_deterministic() {
+        let chunk = compile_source("let result = false || true && false;").unwrap();
+
+        assert_eq!(
+            disassemble_chunk(&chunk, "logical").unwrap(),
+            disassemble_chunk(&chunk, "logical").unwrap()
+        );
+    }
+
+    #[test]
+    fn vm_matches_interpreter_for_logical_and() {
+        let source = "let result = 0 && 42;";
+
+        assert_eq!(
+            run_source_and_get(source, "result").to_string(),
+            interpreter_global(source, "result")
+        );
+    }
+
+    #[test]
+    fn vm_matches_interpreter_for_logical_or() {
+        let source = "let result = \"\" || \"fallback\";";
+
+        assert_eq!(
+            run_source_and_get(source, "result").to_string(),
+            interpreter_global(source, "result")
+        );
+    }
+
+    #[test]
+    fn vm_matches_interpreter_for_mixed_logical_expression() {
+        let source = "let result = false || \"yes\" && 7;";
+
+        assert_eq!(
+            run_source_and_get(source, "result").to_string(),
+            interpreter_global(source, "result")
+        );
+    }
+
+    #[test]
+    fn vm_matches_interpreter_for_short_circuit_side_effect() {
+        let source = "let x = 0; false && (x = 1); let result = x;";
+
+        assert_eq!(
+            run_source_and_get(source, "result").to_string(),
+            interpreter_global(source, "result")
+        );
+    }
+
+    #[test]
     fn rejects_source_return_statement_with_span() {
         assert_eq!(
             compile_source("return 1;"),
@@ -1181,13 +1490,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_logical_and() {
-        assert_unsupported_expression("let result = true && false;", "logical And");
+    fn rejects_object_literal() {
+        assert_unsupported_expression("let result = { value: 1 };", "object literal");
     }
 
     #[test]
-    fn rejects_logical_or() {
-        assert_unsupported_expression("let result = true || false;", "logical Or");
+    fn rejects_member_access() {
+        assert_unsupported_expression("let result = value.member;", "member access");
     }
 
     #[test]
