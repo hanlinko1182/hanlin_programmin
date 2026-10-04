@@ -40,5 +40,8 @@ pub enum OpCode {
     LessEqual,
     Greater,
     GreaterEqual,
+    DefineGlobal(ConstantIndex),
+    GetGlobal(ConstantIndex),
+    SetGlobal(ConstantIndex),
     Return,
 }

@@ -40,8 +40,8 @@ impl std::error::Error for ChunkError {}
 
 /// One unit of bytecode, including instructions, constants, and source spans.
 ///
-/// `Chunk` is a representation foundation only: the current compiler does not
-/// yet translate AST nodes into chunks, and the runtime does not execute them.
+/// The current compiler does not yet translate AST nodes into chunks. For now,
+/// chunks are constructed manually and can be executed by the experimental VM.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Chunk {
     instructions: Vec<Instruction>,

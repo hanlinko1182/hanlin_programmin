@@ -6,6 +6,7 @@
 //! instead of depending on Rust's debug or release overflow behavior.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::error::Span;
@@ -56,6 +57,17 @@ pub enum VmError {
     IntegerOverflow {
         instruction_offset: usize,
         opcode: OpCode,
+        span: Span,
+    },
+    InvalidGlobalName {
+        instruction_offset: usize,
+        index: u32,
+        value: Value,
+        span: Span,
+    },
+    UndefinedGlobal {
+        instruction_offset: usize,
+        name: String,
         span: Span,
     },
 }
@@ -142,6 +154,23 @@ impl fmt::Display for VmError {
                 f,
                 "integer overflow while executing {opcode:?} at instruction {instruction_offset} ({span})"
             ),
+            Self::InvalidGlobalName {
+                instruction_offset,
+                index,
+                value,
+                span,
+            } => write!(
+                f,
+                "global name at constant index {index} is not a string at instruction {instruction_offset} ({span}): {value:?}"
+            ),
+            Self::UndefinedGlobal {
+                instruction_offset,
+                name,
+                span,
+            } => write!(
+                f,
+                "undefined global '{name}' at instruction {instruction_offset} ({span})"
+            ),
         }
     }
 }
@@ -151,30 +180,33 @@ impl std::error::Error for VmError {}
 /// The basic stack virtual machine for Hanlin bytecode.
 ///
 /// The operand stack is private and belongs to one execution. Both it and the
-/// instruction pointer are reset before and after every [`run`](Self::run), so
-/// one `Vm` can safely execute independent chunks without retaining values.
+/// instruction pointer are reset before and after every [`run`](Self::run).
+/// Global bindings are intentionally retained across runs for future REPL use.
 #[derive(Debug)]
 pub struct Vm {
     stack: Vec<Value>,
     instruction_pointer: usize,
+    globals: HashMap<String, Value>,
 }
 
 impl Vm {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             stack: Vec::new(),
             instruction_pointer: 0,
+            globals: HashMap::new(),
         }
     }
 
     /// Executes `chunk` until `Return` or a structured [`VmError`].
     ///
     /// `Return` yields the top stack value. If the stack is empty, it yields
-    /// [`Value::Null`]. Execution state is cleared on both success and failure.
+    /// [`Value::Null`]. The stack and instruction pointer are cleared on both
+    /// success and failure, while global bindings persist.
     pub fn run(&mut self, chunk: &Chunk) -> Result<Value, VmError> {
-        self.reset();
+        self.reset_execution_state();
         let result = self.execute(chunk);
-        self.reset();
+        self.reset_execution_state();
         result
     }
 
@@ -236,6 +268,15 @@ impl Vm {
                     self.execute_comparison(opcode, instruction_offset, span)?;
                 }
                 OpCode::Not => self.execute_not(instruction_offset, span)?,
+                OpCode::DefineGlobal(index) => {
+                    self.define_global(chunk, index, instruction_offset, span)?;
+                }
+                OpCode::GetGlobal(index) => {
+                    self.get_global(chunk, index, instruction_offset, span)?;
+                }
+                OpCode::SetGlobal(index) => {
+                    self.set_global(chunk, index, instruction_offset, span)?;
+                }
                 OpCode::Return => return Ok(self.stack.pop().unwrap_or(Value::Null)),
             }
         }
@@ -548,7 +589,94 @@ impl Vm {
         })
     }
 
-    fn reset(&mut self) {
+    fn define_global(
+        &mut self,
+        chunk: &Chunk,
+        index: super::ConstantIndex,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let name = Self::global_name(chunk, index, instruction_offset, span)?;
+        let value =
+            self.pop_unary_operand(OpCode::DefineGlobal(index), instruction_offset, span)?;
+        self.globals.insert(name, value);
+        Ok(())
+    }
+
+    fn get_global(
+        &mut self,
+        chunk: &Chunk,
+        index: super::ConstantIndex,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let name = Self::global_name(chunk, index, instruction_offset, span)?;
+        let value = self
+            .globals
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| VmError::UndefinedGlobal {
+                instruction_offset,
+                name: name.clone(),
+                span,
+            })?;
+        self.stack.push(value);
+        Ok(())
+    }
+
+    fn set_global(
+        &mut self,
+        chunk: &Chunk,
+        index: super::ConstantIndex,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let name = Self::global_name(chunk, index, instruction_offset, span)?;
+        let value = self.stack.last().cloned().ok_or(VmError::StackUnderflow {
+            instruction_offset,
+            opcode: OpCode::SetGlobal(index),
+            needed: 1,
+            available: 0,
+            span,
+        })?;
+        let binding = self
+            .globals
+            .get_mut(&name)
+            .ok_or_else(|| VmError::UndefinedGlobal {
+                instruction_offset,
+                name: name.clone(),
+                span,
+            })?;
+        *binding = value;
+        Ok(())
+    }
+
+    fn global_name(
+        chunk: &Chunk,
+        index: super::ConstantIndex,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<String, VmError> {
+        let value = chunk
+            .constant(index)
+            .ok_or(VmError::InvalidConstantReference {
+                instruction_offset,
+                index: index.as_u32(),
+                constant_count: chunk.constants().len(),
+                span,
+            })?;
+        match value {
+            Value::String(name) => Ok(name.clone()),
+            value => Err(VmError::InvalidGlobalName {
+                instruction_offset,
+                index: index.as_u32(),
+                value: value.clone(),
+                span,
+            }),
+        }
+    }
+
+    fn reset_execution_state(&mut self) {
         self.stack.clear();
         self.instruction_pointer = 0;
     }
@@ -613,6 +741,34 @@ mod tests {
 
     fn run_unary(value: Value, opcode: OpCode) -> Result<Value, VmError> {
         Vm::new().run(&unary_chunk(value, opcode))
+    }
+
+    fn define_global_chunk(name: &str, value: Value) -> Chunk {
+        let mut chunk = Chunk::new();
+        let name = chunk.add_constant(Value::String(name.to_owned())).unwrap();
+        let value = chunk.add_constant(value).unwrap();
+        chunk.write_instruction(OpCode::Constant(value), SPAN);
+        chunk.write_instruction(OpCode::DefineGlobal(name), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+        chunk
+    }
+
+    fn get_global_chunk(name: &str) -> Chunk {
+        let mut chunk = Chunk::new();
+        let name = chunk.add_constant(Value::String(name.to_owned())).unwrap();
+        chunk.write_instruction(OpCode::GetGlobal(name), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+        chunk
+    }
+
+    fn set_global_chunk(name: &str, value: Value) -> Chunk {
+        let mut chunk = Chunk::new();
+        let name = chunk.add_constant(Value::String(name.to_owned())).unwrap();
+        let value = chunk.add_constant(value).unwrap();
+        chunk.write_instruction(OpCode::Constant(value), SPAN);
+        chunk.write_instruction(OpCode::SetGlobal(name), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+        chunk
     }
 
     #[test]
@@ -1426,6 +1582,260 @@ mod tests {
     fn logical_not_result_is_returned() {
         let chunk = unary_chunk(Value::Bool(false), OpCode::Not);
         assert_eq!(Vm::new().run(&chunk), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn defines_integer_global() {
+        let mut vm = Vm::new();
+
+        assert_eq!(
+            vm.run(&define_global_chunk("answer", Value::Int(42))),
+            Ok(Value::Null)
+        );
+        assert_eq!(vm.globals.get("answer"), Some(&Value::Int(42)));
+    }
+
+    #[test]
+    fn defines_float_global() {
+        let mut vm = Vm::new();
+        vm.run(&define_global_chunk("pi", Value::Float(3.14)))
+            .unwrap();
+
+        assert_eq!(vm.globals.get("pi"), Some(&Value::Float(3.14)));
+    }
+
+    #[test]
+    fn defines_string_global() {
+        let mut vm = Vm::new();
+        vm.run(&define_global_chunk(
+            "language",
+            Value::String("hanlin".to_owned()),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            vm.globals.get("language"),
+            Some(&Value::String("hanlin".to_owned()))
+        );
+    }
+
+    #[test]
+    fn gets_defined_global() {
+        let mut vm = Vm::new();
+        vm.run(&define_global_chunk("answer", Value::Int(42)))
+            .unwrap();
+
+        assert_eq!(vm.run(&get_global_chunk("answer")), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn sets_existing_global() {
+        let mut vm = Vm::new();
+        vm.run(&define_global_chunk("answer", Value::Int(42)))
+            .unwrap();
+        vm.run(&set_global_chunk("answer", Value::Int(100)))
+            .unwrap();
+
+        assert_eq!(vm.globals.get("answer"), Some(&Value::Int(100)));
+    }
+
+    #[test]
+    fn set_global_leaves_assigned_value_on_stack() {
+        let mut vm = Vm::new();
+        vm.run(&define_global_chunk("answer", Value::Int(42)))
+            .unwrap();
+
+        assert_eq!(
+            vm.run(&set_global_chunk("answer", Value::Int(100))),
+            Ok(Value::Int(100))
+        );
+    }
+
+    #[test]
+    fn define_global_consumes_declared_value() {
+        let mut vm = Vm::new();
+
+        assert_eq!(
+            vm.run(&define_global_chunk("x", Value::Int(10))),
+            Ok(Value::Null)
+        );
+    }
+
+    #[test]
+    fn undefined_get_returns_error() {
+        assert_eq!(
+            Vm::new().run(&get_global_chunk("missing")),
+            Err(VmError::UndefinedGlobal {
+                instruction_offset: 0,
+                name: "missing".to_owned(),
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn undefined_set_returns_error() {
+        assert_eq!(
+            Vm::new().run(&set_global_chunk("missing", Value::Int(1))),
+            Err(VmError::UndefinedGlobal {
+                instruction_offset: 1,
+                name: "missing".to_owned(),
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn non_string_global_name_returns_error() {
+        let mut chunk = Chunk::new();
+        let name = chunk.add_constant(Value::Int(7)).unwrap();
+        let value = chunk.add_constant(Value::Int(42)).unwrap();
+        chunk.write_instruction(OpCode::Constant(value), SPAN);
+        chunk.write_instruction(OpCode::DefineGlobal(name), SPAN);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidGlobalName {
+                instruction_offset: 1,
+                index: 0,
+                value: Value::Int(7),
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn missing_global_name_constant_returns_error() {
+        let mut chunk = Chunk::new();
+        let value = chunk.add_constant(Value::Int(42)).unwrap();
+        chunk.write_instruction(OpCode::Constant(value), SPAN);
+        chunk.write_instruction(OpCode::DefineGlobal(ConstantIndex::new(9)), SPAN);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidConstantReference {
+                instruction_offset: 1,
+                index: 9,
+                constant_count: 1,
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn multiple_globals_remain_independent() {
+        let mut vm = Vm::new();
+        vm.run(&define_global_chunk("x", Value::Int(10))).unwrap();
+        vm.run(&define_global_chunk("y", Value::Int(20))).unwrap();
+
+        assert_eq!(vm.run(&get_global_chunk("x")), Ok(Value::Int(10)));
+        assert_eq!(vm.run(&get_global_chunk("y")), Ok(Value::Int(20)));
+    }
+
+    #[test]
+    fn overwriting_one_global_does_not_affect_another() {
+        let mut vm = Vm::new();
+        vm.run(&define_global_chunk("x", Value::Int(10))).unwrap();
+        vm.run(&define_global_chunk("y", Value::Int(20))).unwrap();
+        vm.run(&set_global_chunk("x", Value::Int(99))).unwrap();
+
+        assert_eq!(vm.run(&get_global_chunk("x")), Ok(Value::Int(99)));
+        assert_eq!(vm.run(&get_global_chunk("y")), Ok(Value::Int(20)));
+    }
+
+    #[test]
+    fn globals_persist_across_runs() {
+        let mut vm = Vm::new();
+        vm.run(&define_global_chunk("x", Value::Int(10))).unwrap();
+
+        assert_eq!(vm.run(&get_global_chunk("x")), Ok(Value::Int(10)));
+    }
+
+    #[test]
+    fn operand_stack_resets_while_globals_persist() {
+        let mut vm = Vm::new();
+        vm.run(&define_global_chunk("x", Value::Int(10))).unwrap();
+
+        let mut leaves_extra_value = Chunk::new();
+        let extra = leaves_extra_value.add_constant(Value::Int(999)).unwrap();
+        let name = leaves_extra_value
+            .add_constant(Value::String("x".to_owned()))
+            .unwrap();
+        leaves_extra_value.write_instruction(OpCode::Constant(extra), SPAN);
+        leaves_extra_value.write_instruction(OpCode::GetGlobal(name), SPAN);
+        leaves_extra_value.write_instruction(OpCode::Return, SPAN);
+        assert_eq!(vm.run(&leaves_extra_value), Ok(Value::Int(10)));
+
+        let mut empty_return = Chunk::new();
+        empty_return.write_instruction(OpCode::Return, SPAN);
+        assert_eq!(vm.run(&empty_return), Ok(Value::Null));
+        assert_eq!(vm.run(&get_global_chunk("x")), Ok(Value::Int(10)));
+    }
+
+    #[test]
+    fn vm_is_reusable_after_undefined_global_error() {
+        let mut vm = Vm::new();
+        vm.run(&define_global_chunk("x", Value::Int(10))).unwrap();
+
+        assert!(matches!(
+            vm.run(&get_global_chunk("missing")),
+            Err(VmError::UndefinedGlobal { .. })
+        ));
+        assert_eq!(vm.run(&get_global_chunk("x")), Ok(Value::Int(10)));
+        assert!(vm.stack.is_empty());
+        assert_eq!(vm.instruction_pointer, 0);
+    }
+
+    #[test]
+    fn malformed_global_instruction_does_not_panic() {
+        let mut chunk = Chunk::new();
+        let name = chunk.add_constant(Value::Bool(true)).unwrap();
+        chunk.write_instruction(OpCode::GetGlobal(name), SPAN);
+
+        assert!(matches!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidGlobalName { .. })
+        ));
+    }
+
+    #[test]
+    fn define_global_without_value_returns_stack_underflow() {
+        let mut chunk = Chunk::new();
+        let name = chunk.add_constant(Value::String("x".to_owned())).unwrap();
+        chunk.write_instruction(OpCode::DefineGlobal(name), SPAN);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::StackUnderflow {
+                instruction_offset: 0,
+                opcode: OpCode::DefineGlobal(name),
+                needed: 1,
+                available: 0,
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn set_global_without_value_returns_stack_underflow() {
+        let mut vm = Vm::new();
+        vm.run(&define_global_chunk("x", Value::Int(10))).unwrap();
+
+        let mut chunk = Chunk::new();
+        let name = chunk.add_constant(Value::String("x".to_owned())).unwrap();
+        chunk.write_instruction(OpCode::SetGlobal(name), SPAN);
+
+        assert_eq!(
+            vm.run(&chunk),
+            Err(VmError::StackUnderflow {
+                instruction_offset: 0,
+                opcode: OpCode::SetGlobal(name),
+                needed: 1,
+                available: 0,
+                span: SPAN,
+            })
+        );
+        assert_eq!(vm.run(&get_global_chunk("x")), Ok(Value::Int(10)));
     }
 
     #[test]

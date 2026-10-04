@@ -6,7 +6,7 @@
 use std::fmt;
 use std::fmt::Write;
 
-use super::{Chunk, OpCode, Value};
+use super::{Chunk, ConstantIndex, OpCode, Value};
 
 /// An error found while disassembling a bytecode chunk.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,6 +19,10 @@ pub enum DisassembleError {
         offset: usize,
         index: u32,
         constant_count: usize,
+    },
+    InvalidGlobalName {
+        offset: usize,
+        index: u32,
     },
 }
 
@@ -39,6 +43,10 @@ impl fmt::Display for DisassembleError {
             } => write!(
                 f,
                 "instruction {offset} references constant index {index}, but the chunk contains {constant_count} constants"
+            ),
+            Self::InvalidGlobalName { offset, index } => write!(
+                f,
+                "instruction {offset} references constant index {index} as a global name, but it is not a string"
             ),
         }
     }
@@ -71,23 +79,44 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> Result<String, D
     let opcode = instruction.opcode();
     let name = opcode_name(opcode);
 
-    if let OpCode::Constant(index) = opcode {
-        let value = chunk
-            .constant(index)
-            .ok_or(DisassembleError::InvalidConstantIndex {
-                offset,
-                index: index.as_u32(),
-                constant_count: chunk.constants().len(),
-            })?;
-
-        Ok(format!(
-            "{offset:04}  {span:<6} {name:<14} {:<4} {}",
-            index.as_u32(),
-            format_constant(value)
-        ))
-    } else {
-        Ok(format!("{offset:04}  {span:<6} {name}"))
+    match opcode {
+        OpCode::Constant(index) => {
+            format_indexed_instruction(chunk, offset, &span, name, index, false)
+        }
+        OpCode::DefineGlobal(index) | OpCode::GetGlobal(index) | OpCode::SetGlobal(index) => {
+            format_indexed_instruction(chunk, offset, &span, name, index, true)
+        }
+        _ => Ok(format!("{offset:04}  {span:<6} {name}")),
     }
+}
+
+fn format_indexed_instruction(
+    chunk: &Chunk,
+    offset: usize,
+    span: &str,
+    name: &str,
+    index: ConstantIndex,
+    require_string: bool,
+) -> Result<String, DisassembleError> {
+    let value = chunk
+        .constant(index)
+        .ok_or(DisassembleError::InvalidConstantIndex {
+            offset,
+            index: index.as_u32(),
+            constant_count: chunk.constants().len(),
+        })?;
+    if require_string && !matches!(value, Value::String(_)) {
+        return Err(DisassembleError::InvalidGlobalName {
+            offset,
+            index: index.as_u32(),
+        });
+    }
+
+    Ok(format!(
+        "{offset:04}  {span:<6} {name:<14} {:<4} {}",
+        index.as_u32(),
+        format_constant(value)
+    ))
 }
 
 fn opcode_name(opcode: OpCode) -> &'static str {
@@ -110,6 +139,9 @@ fn opcode_name(opcode: OpCode) -> &'static str {
         OpCode::LessEqual => "LESS_EQUAL",
         OpCode::Greater => "GREATER",
         OpCode::GreaterEqual => "GREATER_EQUAL",
+        OpCode::DefineGlobal(_) => "DEFINE_GLOBAL",
+        OpCode::GetGlobal(_) => "GET_GLOBAL",
+        OpCode::SetGlobal(_) => "SET_GLOBAL",
         OpCode::Return => "RETURN",
     }
 }
@@ -306,6 +338,78 @@ mod tests {
             Err(DisassembleError::InvalidInstructionOffset {
                 offset: 3,
                 instruction_count: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn disassembles_define_global() {
+        let mut chunk = Chunk::new();
+        let name = chunk
+            .add_constant(Value::String("answer".to_owned()))
+            .unwrap();
+        chunk.write_instruction(OpCode::DefineGlobal(name), Span::new(1, 5));
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0).unwrap(),
+            "0000  1:5    DEFINE_GLOBAL  0    \"answer\""
+        );
+    }
+
+    #[test]
+    fn disassembles_get_global() {
+        let mut chunk = Chunk::new();
+        let name = chunk
+            .add_constant(Value::String("answer".to_owned()))
+            .unwrap();
+        chunk.write_instruction(OpCode::GetGlobal(name), Span::new(2, 1));
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0).unwrap(),
+            "0000  2:1    GET_GLOBAL     0    \"answer\""
+        );
+    }
+
+    #[test]
+    fn disassembles_set_global() {
+        let mut chunk = Chunk::new();
+        let name = chunk
+            .add_constant(Value::String("answer".to_owned()))
+            .unwrap();
+        chunk.write_instruction(OpCode::SetGlobal(name), Span::new(3, 1));
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0).unwrap(),
+            "0000  3:1    SET_GLOBAL     0    \"answer\""
+        );
+    }
+
+    #[test]
+    fn rejects_missing_global_name_constant() {
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(OpCode::GetGlobal(ConstantIndex::new(4)), Span::new(1, 1));
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0),
+            Err(DisassembleError::InvalidConstantIndex {
+                offset: 0,
+                index: 4,
+                constant_count: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_non_string_global_name_without_panicking() {
+        let mut chunk = Chunk::new();
+        let name = chunk.add_constant(Value::Int(42)).unwrap();
+        chunk.write_instruction(OpCode::DefineGlobal(name), Span::new(1, 1));
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0),
+            Err(DisassembleError::InvalidGlobalName {
+                offset: 0,
+                index: 0,
             })
         );
     }
