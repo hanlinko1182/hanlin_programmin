@@ -15,6 +15,20 @@ pub enum Value {
     String(String),
 }
 
+impl Value {
+    /// Returns this VM value's truthiness using the tree-walking interpreter's
+    /// primitive-value semantics.
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            Self::Null => false,
+            Self::Bool(value) => *value,
+            Self::Int(value) => *value != 0,
+            Self::Float(value) => *value != 0.0 && !value.is_nan(),
+            Self::String(value) => !value.is_empty(),
+        }
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -60,5 +74,19 @@ mod tests {
             format!("{:?}", Value::String("text".to_owned())),
             "String(\"text\")"
         );
+    }
+
+    #[test]
+    fn truthiness_matches_interpreter_primitives() {
+        assert!(!Value::Null.is_truthy());
+        assert!(!Value::Bool(false).is_truthy());
+        assert!(Value::Bool(true).is_truthy());
+        assert!(!Value::Int(0).is_truthy());
+        assert!(Value::Int(-1).is_truthy());
+        assert!(!Value::Float(0.0).is_truthy());
+        assert!(!Value::Float(f64::NAN).is_truthy());
+        assert!(Value::Float(0.5).is_truthy());
+        assert!(!Value::String(String::new()).is_truthy());
+        assert!(Value::String("hanlin".to_owned()).is_truthy());
     }
 }

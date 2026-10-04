@@ -5,6 +5,7 @@
 //! Integer arithmetic is checked and reports [`VmError::IntegerOverflow`]
 //! instead of depending on Rust's debug or release overflow behavior.
 
+use std::cmp::Ordering;
 use std::fmt;
 
 use crate::error::Span;
@@ -226,14 +227,16 @@ impl Vm {
                     self.execute_binary(opcode, instruction_offset, span)?;
                 }
                 OpCode::Negate => self.execute_negate(instruction_offset, span)?,
-                OpCode::Return => return Ok(self.stack.pop().unwrap_or(Value::Null)),
-                opcode => {
-                    return Err(VmError::UnsupportedOpcode {
-                        instruction_offset,
-                        opcode,
-                        span,
-                    });
+                opcode @ (OpCode::Equal
+                | OpCode::NotEqual
+                | OpCode::Less
+                | OpCode::LessEqual
+                | OpCode::Greater
+                | OpCode::GreaterEqual) => {
+                    self.execute_comparison(opcode, instruction_offset, span)?;
                 }
+                OpCode::Not => self.execute_not(instruction_offset, span)?,
+                OpCode::Return => return Ok(self.stack.pop().unwrap_or(Value::Null)),
             }
         }
     }
@@ -244,6 +247,18 @@ impl Vm {
         instruction_offset: usize,
         span: Span,
     ) -> Result<(), VmError> {
+        let (left, right) = self.pop_binary_operands(opcode, instruction_offset, span)?;
+        let result = Self::calculate_binary(opcode, left, right, instruction_offset, span)?;
+        self.stack.push(result);
+        Ok(())
+    }
+
+    fn pop_binary_operands(
+        &mut self,
+        opcode: OpCode,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(Value, Value), VmError> {
         let available = self.stack.len();
         if available < 2 {
             return Err(VmError::StackUnderflow {
@@ -269,9 +284,7 @@ impl Vm {
             available,
             span,
         })?;
-        let result = Self::calculate_binary(opcode, left, right, instruction_offset, span)?;
-        self.stack.push(result);
-        Ok(())
+        Ok((left, right))
     }
 
     fn calculate_binary(
@@ -409,13 +422,7 @@ impl Vm {
     }
 
     fn execute_negate(&mut self, instruction_offset: usize, span: Span) -> Result<(), VmError> {
-        let operand = self.stack.pop().ok_or(VmError::StackUnderflow {
-            instruction_offset,
-            opcode: OpCode::Negate,
-            needed: 1,
-            available: 0,
-            span,
-        })?;
+        let operand = self.pop_unary_operand(OpCode::Negate, instruction_offset, span)?;
         let result = match operand {
             Value::Int(value) => Self::checked_integer(
                 value.checked_neg(),
@@ -436,6 +443,109 @@ impl Vm {
         };
         self.stack.push(result);
         Ok(())
+    }
+
+    fn execute_comparison(
+        &mut self,
+        opcode: OpCode,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let (left, right) = self.pop_binary_operands(opcode, instruction_offset, span)?;
+        let result = match opcode {
+            OpCode::Equal => Self::values_equal(&left, &right),
+            OpCode::NotEqual => !Self::values_equal(&left, &right),
+            OpCode::Less | OpCode::LessEqual | OpCode::Greater | OpCode::GreaterEqual => {
+                Self::compare_ordering(opcode, left, right, instruction_offset, span)?
+            }
+            _ => {
+                return Err(VmError::UnsupportedOpcode {
+                    instruction_offset,
+                    opcode,
+                    span,
+                });
+            }
+        };
+        self.stack.push(Value::Bool(result));
+        Ok(())
+    }
+
+    fn values_equal(left: &Value, right: &Value) -> bool {
+        match (left, right) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(left), Value::Bool(right)) => left == right,
+            (Value::Int(left), Value::Int(right)) => left == right,
+            (Value::Float(left), Value::Float(right)) => left == right,
+            (Value::Int(left), Value::Float(right)) => *left as f64 == *right,
+            (Value::Float(left), Value::Int(right)) => *left == *right as f64,
+            (Value::String(left), Value::String(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    fn compare_ordering(
+        opcode: OpCode,
+        left: Value,
+        right: Value,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<bool, VmError> {
+        let ordering = match (&left, &right) {
+            (Value::Int(left), Value::Int(right)) => left.partial_cmp(right),
+            (Value::Float(left), Value::Float(right)) => left.partial_cmp(right),
+            (Value::Int(left), Value::Float(right)) => (*left as f64).partial_cmp(right),
+            (Value::Float(left), Value::Int(right)) => left.partial_cmp(&(*right as f64)),
+            (Value::String(left), Value::String(right)) => left.partial_cmp(right),
+            _ => {
+                return Err(VmError::TypeError {
+                    instruction_offset,
+                    opcode,
+                    left,
+                    right: Some(right),
+                    span,
+                });
+            }
+        };
+
+        Self::ordering_result(opcode, ordering).ok_or(VmError::UnsupportedOpcode {
+            instruction_offset,
+            opcode,
+            span,
+        })
+    }
+
+    fn ordering_result(opcode: OpCode, ordering: Option<Ordering>) -> Option<bool> {
+        match opcode {
+            OpCode::Less => Some(ordering == Some(Ordering::Less)),
+            OpCode::LessEqual => Some(matches!(ordering, Some(Ordering::Less | Ordering::Equal))),
+            OpCode::Greater => Some(ordering == Some(Ordering::Greater)),
+            OpCode::GreaterEqual => Some(matches!(
+                ordering,
+                Some(Ordering::Greater | Ordering::Equal)
+            )),
+            _ => None,
+        }
+    }
+
+    fn execute_not(&mut self, instruction_offset: usize, span: Span) -> Result<(), VmError> {
+        let operand = self.pop_unary_operand(OpCode::Not, instruction_offset, span)?;
+        self.stack.push(Value::Bool(!operand.is_truthy()));
+        Ok(())
+    }
+
+    fn pop_unary_operand(
+        &mut self,
+        opcode: OpCode,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<Value, VmError> {
+        self.stack.pop().ok_or(VmError::StackUnderflow {
+            instruction_offset,
+            opcode,
+            needed: 1,
+            available: 0,
+            span,
+        })
     }
 
     fn reset(&mut self) {
@@ -488,13 +598,21 @@ mod tests {
         Vm::new().run(&binary_chunk(left, right, opcode))
     }
 
-    fn negate_chunk(value: Value) -> Chunk {
+    fn unary_chunk(value: Value, opcode: OpCode) -> Chunk {
         let mut chunk = Chunk::new();
         let value = chunk.add_constant(value).unwrap();
         chunk.write_instruction(OpCode::Constant(value), SPAN);
-        chunk.write_instruction(OpCode::Negate, SPAN);
+        chunk.write_instruction(opcode, SPAN);
         chunk.write_instruction(OpCode::Return, SPAN);
         chunk
+    }
+
+    fn negate_chunk(value: Value) -> Chunk {
+        unary_chunk(value, OpCode::Negate)
+    }
+
+    fn run_unary(value: Value, opcode: OpCode) -> Result<Value, VmError> {
+        Vm::new().run(&unary_chunk(value, opcode))
     }
 
     #[test]
@@ -625,17 +743,10 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_opcode_returns_error() {
-        let mut chunk = Chunk::new();
-        chunk.write_instruction(OpCode::Equal, Span::new(8, 5));
-
+    fn integer_equality_is_supported() {
         assert_eq!(
-            Vm::new().run(&chunk),
-            Err(VmError::UnsupportedOpcode {
-                instruction_offset: 0,
-                opcode: OpCode::Equal,
-                span: Span::new(8, 5),
-            })
+            run_binary(Value::Int(10), Value::Int(10), OpCode::Equal),
+            Ok(Value::Bool(true))
         );
     }
 
@@ -988,6 +1099,333 @@ mod tests {
                 span: SPAN,
             })
         );
+    }
+
+    #[test]
+    fn null_equals_null() {
+        assert_eq!(
+            run_binary(Value::Null, Value::Null, OpCode::Equal),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn null_is_not_equal_to_bool() {
+        assert_eq!(
+            run_binary(Value::Null, Value::Bool(false), OpCode::NotEqual),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn compares_boolean_equality() {
+        assert_eq!(
+            run_binary(Value::Bool(true), Value::Bool(true), OpCode::Equal),
+            Ok(Value::Bool(true))
+        );
+        assert_eq!(
+            run_binary(Value::Bool(true), Value::Bool(false), OpCode::Equal),
+            Ok(Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn compares_float_equality() {
+        assert_eq!(
+            run_binary(Value::Float(3.5), Value::Float(3.5), OpCode::Equal),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn compares_mixed_numeric_equality() {
+        assert_eq!(
+            run_binary(Value::Int(10), Value::Float(10.0), OpCode::Equal),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn compares_mixed_numeric_inequality() {
+        assert_eq!(
+            run_binary(Value::Int(10), Value::Float(10.5), OpCode::NotEqual),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn compares_string_equality() {
+        assert_eq!(
+            run_binary(
+                Value::String("hanlin".to_owned()),
+                Value::String("hanlin".to_owned()),
+                OpCode::Equal,
+            ),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn compares_string_inequality() {
+        assert_eq!(
+            run_binary(
+                Value::String("hanlin".to_owned()),
+                Value::String("vm".to_owned()),
+                OpCode::NotEqual,
+            ),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn unrelated_primitive_types_compare_unequal() {
+        for (left, right) in [
+            (Value::Int(1), Value::String("1".to_owned())),
+            (Value::Bool(true), Value::Int(1)),
+            (Value::Null, Value::Bool(false)),
+        ] {
+            assert_eq!(
+                run_binary(left, right, OpCode::Equal),
+                Ok(Value::Bool(false))
+            );
+        }
+    }
+
+    #[test]
+    fn compares_integer_less() {
+        assert_eq!(
+            run_binary(Value::Int(5), Value::Int(10), OpCode::Less),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn compares_integer_less_equal() {
+        assert_eq!(
+            run_binary(Value::Int(5), Value::Int(5), OpCode::LessEqual),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn compares_integer_greater() {
+        assert_eq!(
+            run_binary(Value::Int(10), Value::Int(5), OpCode::Greater),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn compares_integer_greater_equal() {
+        assert_eq!(
+            run_binary(Value::Int(6), Value::Int(6), OpCode::GreaterEqual),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn compares_float_ordering() {
+        assert_eq!(
+            run_binary(Value::Float(1.5), Value::Float(2.5), OpCode::Less),
+            Ok(Value::Bool(true))
+        );
+        assert_eq!(
+            run_binary(Value::Float(2.5), Value::Float(1.5), OpCode::Greater,),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn compares_mixed_numeric_ordering() {
+        assert_eq!(
+            run_binary(Value::Int(5), Value::Float(5.5), OpCode::Less),
+            Ok(Value::Bool(true))
+        );
+        assert_eq!(
+            run_binary(Value::Float(6.0), Value::Int(6), OpCode::GreaterEqual),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn invalid_ordering_types_return_type_error() {
+        assert_eq!(
+            run_binary(Value::Bool(true), Value::Bool(false), OpCode::Less),
+            Err(VmError::TypeError {
+                instruction_offset: 2,
+                opcode: OpCode::Less,
+                left: Value::Bool(true),
+                right: Some(Value::Bool(false)),
+                span: SPAN,
+            })
+        );
+        assert!(matches!(
+            run_binary(Value::Null, Value::Int(1), OpCode::Greater),
+            Err(VmError::TypeError {
+                opcode: OpCode::Greater,
+                ..
+            })
+        ));
+        assert!(matches!(
+            run_binary(Value::String("abc".to_owned()), Value::Int(3), OpCode::Less,),
+            Err(VmError::TypeError {
+                opcode: OpCode::Less,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn orders_strings_lexically_like_interpreter() {
+        let apple = Value::String("apple".to_owned());
+        let banana = Value::String("banana".to_owned());
+
+        assert_eq!(
+            run_binary(apple.clone(), banana.clone(), OpCode::Less),
+            Ok(Value::Bool(true))
+        );
+        assert_eq!(
+            run_binary(apple.clone(), apple.clone(), OpCode::LessEqual),
+            Ok(Value::Bool(true))
+        );
+        assert_eq!(
+            run_binary(banana.clone(), apple.clone(), OpCode::Greater),
+            Ok(Value::Bool(true))
+        );
+        assert_eq!(
+            run_binary(banana.clone(), banana, OpCode::GreaterEqual),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn logical_not_of_null_is_true() {
+        assert_eq!(run_unary(Value::Null, OpCode::Not), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn logical_not_of_bool_inverts_truthiness() {
+        assert_eq!(
+            run_unary(Value::Bool(false), OpCode::Not),
+            Ok(Value::Bool(true))
+        );
+        assert_eq!(
+            run_unary(Value::Bool(true), OpCode::Not),
+            Ok(Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn logical_not_of_integer_zero_is_true() {
+        assert_eq!(run_unary(Value::Int(0), OpCode::Not), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn logical_not_of_nonzero_integer_is_false() {
+        assert_eq!(
+            run_unary(Value::Int(-1), OpCode::Not),
+            Ok(Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn logical_not_of_float_zero_is_true() {
+        assert_eq!(
+            run_unary(Value::Float(0.0), OpCode::Not),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn logical_not_of_nonzero_float_is_false() {
+        assert_eq!(
+            run_unary(Value::Float(0.5), OpCode::Not),
+            Ok(Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn logical_not_of_empty_string_is_true() {
+        assert_eq!(
+            run_unary(Value::String(String::new()), OpCode::Not),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn logical_not_of_nonempty_string_is_false() {
+        assert_eq!(
+            run_unary(Value::String("hanlin".to_owned()), OpCode::Not),
+            Ok(Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn logical_not_of_nan_matches_interpreter() {
+        assert_eq!(
+            run_unary(Value::Float(f64::NAN), OpCode::Not),
+            Ok(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn comparison_stack_underflow_is_structured() {
+        let mut chunk = Chunk::new();
+        let right = chunk.add_constant(Value::Int(1)).unwrap();
+        chunk.write_instruction(OpCode::Constant(right), SPAN);
+        chunk.write_instruction(OpCode::Less, SPAN);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::StackUnderflow {
+                instruction_offset: 1,
+                opcode: OpCode::Less,
+                needed: 2,
+                available: 1,
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn logical_not_stack_underflow_is_structured() {
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(OpCode::Not, SPAN);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::StackUnderflow {
+                instruction_offset: 0,
+                opcode: OpCode::Not,
+                needed: 1,
+                available: 0,
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn vm_is_reusable_after_comparison_error() {
+        let invalid = binary_chunk(Value::Null, Value::Int(1), OpCode::Less);
+        let valid = binary_chunk(Value::Int(1), Value::Int(2), OpCode::Less);
+        let mut vm = Vm::new();
+
+        assert!(matches!(vm.run(&invalid), Err(VmError::TypeError { .. })));
+        assert_eq!(vm.run(&valid), Ok(Value::Bool(true)));
+        assert!(vm.stack.is_empty());
+        assert_eq!(vm.instruction_pointer, 0);
+    }
+
+    #[test]
+    fn comparison_result_is_returned() {
+        let chunk = binary_chunk(Value::Int(2), Value::Int(3), OpCode::Less);
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn logical_not_result_is_returned() {
+        let chunk = unary_chunk(Value::Bool(false), OpCode::Not);
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Bool(true)));
     }
 
     #[test]
