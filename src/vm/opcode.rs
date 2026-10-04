@@ -82,11 +82,116 @@ impl fmt::Display for LocalSlotError {
 
 impl std::error::Error for LocalSlotError {}
 
+/// An instruction-relative distance used by control-flow bytecode.
+///
+/// The VM applies this distance to the instruction pointer after the jump
+/// instruction has been fetched. Use [`TryFrom<usize>`] for checked conversion
+/// from indexes or distances calculated by future compiler backpatching.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct JumpOffset(u16);
+
+impl JumpOffset {
+    pub const MAX: Self = Self(u16::MAX);
+
+    pub const fn new(offset: u16) -> Self {
+        Self(offset)
+    }
+
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl From<u16> for JumpOffset {
+    fn from(offset: u16) -> Self {
+        Self::new(offset)
+    }
+}
+
+impl TryFrom<usize> for JumpOffset {
+    type Error = JumpOffsetError;
+
+    fn try_from(offset: usize) -> Result<Self, Self::Error> {
+        u16::try_from(offset)
+            .map(Self::new)
+            .map_err(|_| JumpOffsetError { offset })
+    }
+}
+
+/// A platform-sized jump distance that cannot fit in [`JumpOffset`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JumpOffsetError {
+    offset: usize,
+}
+
+impl JumpOffsetError {
+    pub const fn offset(self) -> usize {
+        self.offset
+    }
+}
+
+impl fmt::Display for JumpOffsetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "jump offset {} exceeds the maximum supported offset {}",
+            self.offset,
+            JumpOffset::MAX.as_u16()
+        )
+    }
+}
+
+impl std::error::Error for JumpOffsetError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JumpDirection {
+    Forward,
+    Backward,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JumpTargetError {
+    pub(crate) target: Option<usize>,
+}
+
+/// Resolves a jump relative to the post-fetch instruction pointer.
+///
+/// Targets must identify an existing instruction. In particular, an offset
+/// resolving exactly to `instruction_count` is rejected rather than treated
+/// as implicit program termination.
+pub(crate) fn resolve_jump_target(
+    instruction_offset: usize,
+    offset: JumpOffset,
+    direction: JumpDirection,
+    instruction_count: usize,
+) -> Result<usize, JumpTargetError> {
+    let post_fetch_ip = instruction_offset
+        .checked_add(1)
+        .ok_or(JumpTargetError { target: None })?;
+    let target = match direction {
+        JumpDirection::Forward => post_fetch_ip.checked_add(offset.as_usize()),
+        JumpDirection::Backward => post_fetch_ip.checked_sub(offset.as_usize()),
+    }
+    .ok_or(JumpTargetError { target: None })?;
+
+    if target < instruction_count {
+        Ok(target)
+    } else {
+        Err(JumpTargetError {
+            target: Some(target),
+        })
+    }
+}
+
 /// A single operation understood by Hanlin's future stack-based VM.
 ///
-/// Variants carry their operands directly, as `Constant` does here. This
-/// keeps the representation strongly typed while leaving room for later
-/// operands such as local slots, jump offsets, and call arity.
+/// Variants carry their operands directly. This keeps constant indexes, local
+/// slots, and jump distances strongly typed while leaving room for later
+/// operands such as call arity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpCode {
     Constant(ConstantIndex),
@@ -112,12 +217,15 @@ pub enum OpCode {
     DefineGlobal(ConstantIndex),
     GetGlobal(ConstantIndex),
     SetGlobal(ConstantIndex),
+    Jump(JumpOffset),
+    JumpIfFalse(JumpOffset),
+    Loop(JumpOffset),
     Return,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalSlot, LocalSlotError};
+    use super::{JumpOffset, JumpOffsetError, LocalSlot, LocalSlotError};
 
     #[test]
     fn constructs_valid_local_slot() {
@@ -150,5 +258,38 @@ mod tests {
 
         assert_eq!(error, LocalSlotError { slot: attempted });
         assert_eq!(error.slot(), attempted);
+    }
+
+    #[test]
+    fn constructs_valid_jump_offset() {
+        let offset = JumpOffset::new(42);
+
+        assert_eq!(offset.as_u16(), 42);
+        assert_eq!(offset.as_usize(), 42);
+    }
+
+    #[test]
+    fn jump_offset_supports_equality_and_debugging() {
+        let offset = JumpOffset::new(7);
+
+        assert_eq!(offset, JumpOffset::from(7));
+        assert_eq!(format!("{offset:?}"), "JumpOffset(7)");
+    }
+
+    #[test]
+    fn supports_maximum_jump_offset() {
+        let offset = JumpOffset::try_from(usize::from(u16::MAX)).unwrap();
+
+        assert_eq!(offset, JumpOffset::MAX);
+        assert_eq!(offset.as_u16(), u16::MAX);
+    }
+
+    #[test]
+    fn rejects_jump_offset_overflow() {
+        let attempted = usize::from(u16::MAX) + 1;
+        let error = JumpOffset::try_from(attempted).unwrap_err();
+
+        assert_eq!(error, JumpOffsetError { offset: attempted });
+        assert_eq!(error.offset(), attempted);
     }
 }

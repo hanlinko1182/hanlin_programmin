@@ -11,7 +11,8 @@ use std::fmt;
 
 use crate::error::Span;
 
-use super::{Chunk, LocalSlot, OpCode, Value};
+use super::opcode::{resolve_jump_target, JumpDirection};
+use super::{Chunk, JumpOffset, LocalSlot, OpCode, Value};
 
 /// A structured failure encountered while executing Hanlin bytecode.
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +64,13 @@ pub enum VmError {
         instruction_offset: usize,
         slot: LocalSlot,
         stack_len: usize,
+        span: Span,
+    },
+    InvalidJumpTarget {
+        instruction_offset: usize,
+        opcode: OpCode,
+        target: Option<usize>,
+        instruction_count: usize,
         span: Span,
     },
     InvalidGlobalName {
@@ -170,6 +178,26 @@ impl fmt::Display for VmError {
                 "local slot {} is invalid for a stack with {stack_len} values at instruction {instruction_offset} ({span})",
                 slot.as_u16()
             ),
+            Self::InvalidJumpTarget {
+                instruction_offset,
+                opcode,
+                target,
+                instruction_count,
+                span,
+            } => {
+                write!(
+                    f,
+                    "invalid jump while executing {opcode:?} at instruction {instruction_offset} ({span})"
+                )?;
+                if let Some(target) = target {
+                    write!(
+                        f,
+                        ": target {target} is outside the chunk's {instruction_count} instructions"
+                    )
+                } else {
+                    write!(f, ": target arithmetic overflowed or underflowed")
+                }
+            }
             Self::InvalidGlobalName {
                 instruction_offset,
                 index,
@@ -298,6 +326,29 @@ impl Vm {
                 }
                 OpCode::SetGlobal(index) => {
                     self.set_global(chunk, index, instruction_offset, span)?;
+                }
+                OpCode::Jump(offset) => {
+                    self.execute_jump(
+                        chunk,
+                        OpCode::Jump(offset),
+                        offset,
+                        JumpDirection::Forward,
+                        instruction_offset,
+                        span,
+                    )?;
+                }
+                OpCode::JumpIfFalse(offset) => {
+                    self.execute_jump_if_false(chunk, offset, instruction_offset, span)?;
+                }
+                OpCode::Loop(offset) => {
+                    self.execute_jump(
+                        chunk,
+                        OpCode::Loop(offset),
+                        offset,
+                        JumpDirection::Backward,
+                        instruction_offset,
+                        span,
+                    )?;
                 }
                 OpCode::Return => return Ok(self.stack.pop().unwrap_or(Value::Null)),
             }
@@ -667,6 +718,77 @@ impl Vm {
             })
     }
 
+    fn execute_jump(
+        &mut self,
+        chunk: &Chunk,
+        opcode: OpCode,
+        offset: JumpOffset,
+        direction: JumpDirection,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        self.instruction_pointer =
+            Self::checked_jump_target(chunk, opcode, offset, direction, instruction_offset, span)?;
+        Ok(())
+    }
+
+    fn execute_jump_if_false(
+        &mut self,
+        chunk: &Chunk,
+        offset: JumpOffset,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let opcode = OpCode::JumpIfFalse(offset);
+        let should_jump = !self
+            .stack
+            .last()
+            .ok_or(VmError::StackUnderflow {
+                instruction_offset,
+                opcode,
+                needed: 1,
+                available: 0,
+                span,
+            })?
+            .is_truthy();
+        let target = Self::checked_jump_target(
+            chunk,
+            opcode,
+            offset,
+            JumpDirection::Forward,
+            instruction_offset,
+            span,
+        )?;
+
+        if should_jump {
+            self.instruction_pointer = target;
+        }
+        Ok(())
+    }
+
+    fn checked_jump_target(
+        chunk: &Chunk,
+        opcode: OpCode,
+        offset: JumpOffset,
+        direction: JumpDirection,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<usize, VmError> {
+        resolve_jump_target(
+            instruction_offset,
+            offset,
+            direction,
+            chunk.instructions().len(),
+        )
+        .map_err(|error| VmError::InvalidJumpTarget {
+            instruction_offset,
+            opcode,
+            target: error.target,
+            instruction_count: chunk.instructions().len(),
+            span,
+        })
+    }
+
     fn define_global(
         &mut self,
         chunk: &Chunk,
@@ -770,7 +892,7 @@ impl Default for Vm {
 mod tests {
     use super::{Vm, VmError};
     use crate::error::Span;
-    use crate::vm::{Chunk, ConstantIndex, LocalSlot, OpCode, Value};
+    use crate::vm::{Chunk, ConstantIndex, JumpOffset, LocalSlot, OpCode, Value};
 
     const SPAN: Span = Span { line: 1, col: 1 };
 
@@ -2170,6 +2292,337 @@ mod tests {
         chunk.write_instruction(OpCode::Return, SPAN);
 
         assert_eq!(Vm::new().run(&chunk), Ok(Value::Bool(true)));
+    }
+
+    #[test]
+    fn jump_skips_instructions() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(10)]);
+        let skipped = chunk.add_constant(Value::Int(99)).unwrap();
+        chunk.write_instruction(OpCode::Jump(JumpOffset::new(1)), SPAN);
+        chunk.write_instruction(OpCode::Constant(skipped), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(10)));
+    }
+
+    #[test]
+    fn jump_preserves_stack() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(10), Value::Int(20)]);
+        chunk.write_instruction(OpCode::Jump(JumpOffset::new(1)), SPAN);
+        chunk.write_instruction(OpCode::Pop, SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(20)));
+    }
+
+    #[test]
+    fn jump_if_false_jumps_on_false() {
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(OpCode::False, SPAN);
+        chunk.write_instruction(OpCode::JumpIfFalse(JumpOffset::new(1)), SPAN);
+        chunk.write_instruction(OpCode::True, SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Bool(false)));
+    }
+
+    #[test]
+    fn jump_if_false_continues_on_true() {
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(OpCode::True, SPAN);
+        chunk.write_instruction(OpCode::JumpIfFalse(JumpOffset::new(1)), SPAN);
+        chunk.write_instruction(OpCode::False, SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Bool(false)));
+    }
+
+    #[test]
+    fn jump_if_false_follows_null_truthiness() {
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(OpCode::Null, SPAN);
+        chunk.write_instruction(OpCode::JumpIfFalse(JumpOffset::new(1)), SPAN);
+        chunk.write_instruction(OpCode::True, SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Null));
+    }
+
+    #[test]
+    fn jump_if_false_follows_integer_zero_truthiness() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(0)]);
+        let skipped = chunk.add_constant(Value::Int(99)).unwrap();
+        chunk.write_instruction(OpCode::JumpIfFalse(JumpOffset::new(1)), SPAN);
+        chunk.write_instruction(OpCode::Constant(skipped), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(0)));
+    }
+
+    #[test]
+    fn jump_if_false_continues_on_nonzero_integer() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(1)]);
+        let next = chunk.add_constant(Value::Int(99)).unwrap();
+        chunk.write_instruction(OpCode::JumpIfFalse(JumpOffset::new(1)), SPAN);
+        chunk.write_instruction(OpCode::Constant(next), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(99)));
+    }
+
+    #[test]
+    fn jump_if_false_follows_empty_string_truthiness() {
+        let mut chunk = chunk_with_stack_values(&[Value::String(String::new())]);
+        let skipped = chunk
+            .add_constant(Value::String("not empty".to_owned()))
+            .unwrap();
+        chunk.write_instruction(OpCode::JumpIfFalse(JumpOffset::new(1)), SPAN);
+        chunk.write_instruction(OpCode::Constant(skipped), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::String(String::new())));
+    }
+
+    #[test]
+    fn jump_if_false_reuses_float_truthiness() {
+        for condition in [Value::Float(0.0), Value::Float(f64::NAN)] {
+            let mut chunk = chunk_with_stack_values(&[condition]);
+            let skipped = chunk.add_constant(Value::Int(99)).unwrap();
+            chunk.write_instruction(OpCode::JumpIfFalse(JumpOffset::new(1)), SPAN);
+            chunk.write_instruction(OpCode::Constant(skipped), SPAN);
+            chunk.write_instruction(OpCode::Return, SPAN);
+
+            assert!(matches!(Vm::new().run(&chunk), Ok(Value::Float(_))));
+        }
+    }
+
+    #[test]
+    fn jump_if_false_does_not_pop_condition() {
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(OpCode::False, SPAN);
+        chunk.write_instruction(OpCode::JumpIfFalse(JumpOffset::new(0)), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Bool(false)));
+    }
+
+    #[test]
+    fn jump_if_false_on_empty_stack_returns_underflow() {
+        let opcode = OpCode::JumpIfFalse(JumpOffset::new(0));
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(opcode, Span::new(4, 2));
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::StackUnderflow {
+                instruction_offset: 0,
+                opcode,
+                needed: 1,
+                available: 0,
+                span: Span::new(4, 2),
+            })
+        );
+    }
+
+    #[test]
+    fn loop_jumps_backward() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(10)]);
+        chunk.write_instruction(OpCode::Jump(JumpOffset::new(1)), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+        chunk.write_instruction(OpCode::Loop(JumpOffset::new(2)), SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(10)));
+    }
+
+    #[test]
+    fn loop_preserves_stack() {
+        let mut chunk = chunk_with_stack_values(&[Value::Int(10), Value::Int(20)]);
+        chunk.write_instruction(OpCode::Jump(JumpOffset::new(1)), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+        chunk.write_instruction(OpCode::Loop(JumpOffset::new(2)), SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(20)));
+    }
+
+    #[test]
+    fn zero_offset_jump_targets_next_instruction() {
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(OpCode::Jump(JumpOffset::new(0)), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Null));
+    }
+
+    #[test]
+    fn forward_jump_to_chunk_end_is_rejected() {
+        let opcode = OpCode::Jump(JumpOffset::new(1));
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(opcode, Span::new(7, 3));
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidJumpTarget {
+                instruction_offset: 0,
+                opcode,
+                target: Some(2),
+                instruction_count: 2,
+                span: Span::new(7, 3),
+            })
+        );
+    }
+
+    #[test]
+    fn backward_jump_underflow_is_rejected() {
+        let opcode = OpCode::Loop(JumpOffset::new(2));
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(opcode, Span::new(8, 4));
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidJumpTarget {
+                instruction_offset: 0,
+                opcode,
+                target: None,
+                instruction_count: 2,
+                span: Span::new(8, 4),
+            })
+        );
+    }
+
+    #[test]
+    fn forward_jump_past_chunk_is_rejected() {
+        let opcode = OpCode::Jump(JumpOffset::MAX);
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(opcode, SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidJumpTarget {
+                instruction_offset: 0,
+                opcode,
+                target: Some(usize::from(u16::MAX) + 1),
+                instruction_count: 2,
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn last_instruction_is_valid_target_but_chunk_end_is_not() {
+        let mut valid = Chunk::new();
+        valid.write_instruction(OpCode::Jump(JumpOffset::new(1)), SPAN);
+        valid.write_instruction(OpCode::True, SPAN);
+        valid.write_instruction(OpCode::Return, SPAN);
+        assert_eq!(Vm::new().run(&valid), Ok(Value::Null));
+
+        let invalid_opcode = OpCode::Jump(JumpOffset::new(2));
+        let mut invalid = Chunk::new();
+        invalid.write_instruction(invalid_opcode, SPAN);
+        invalid.write_instruction(OpCode::True, SPAN);
+        invalid.write_instruction(OpCode::Return, SPAN);
+        assert!(matches!(
+            Vm::new().run(&invalid),
+            Err(VmError::InvalidJumpTarget {
+                target: Some(3),
+                instruction_count: 3,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn jump_if_false_validates_untaken_target() {
+        let opcode = OpCode::JumpIfFalse(JumpOffset::new(2));
+        let mut chunk = Chunk::new();
+        chunk.write_instruction(OpCode::True, SPAN);
+        chunk.write_instruction(opcode, SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidJumpTarget {
+                instruction_offset: 1,
+                opcode,
+                target: Some(4),
+                instruction_count: 3,
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn vm_is_reusable_after_invalid_jump_error() {
+        let mut invalid = Chunk::new();
+        invalid.write_instruction(OpCode::Jump(JumpOffset::new(1)), SPAN);
+        invalid.write_instruction(OpCode::Return, SPAN);
+
+        let mut valid = Chunk::new();
+        valid.write_instruction(OpCode::True, SPAN);
+        valid.write_instruction(OpCode::Return, SPAN);
+
+        let mut vm = Vm::new();
+        assert!(matches!(
+            vm.run(&invalid),
+            Err(VmError::InvalidJumpTarget { .. })
+        ));
+        assert_eq!(vm.run(&valid), Ok(Value::Bool(true)));
+        assert!(vm.stack.is_empty());
+        assert_eq!(vm.instruction_pointer, 0);
+    }
+
+    #[test]
+    fn executes_manual_if_else_bytecode() {
+        let mut chunk = Chunk::new();
+        let then_value = chunk
+            .add_constant(Value::String("then".to_owned()))
+            .unwrap();
+        let else_value = chunk
+            .add_constant(Value::String("else".to_owned()))
+            .unwrap();
+        chunk.write_instruction(OpCode::False, SPAN);
+        chunk.write_instruction(OpCode::JumpIfFalse(JumpOffset::new(3)), SPAN);
+        chunk.write_instruction(OpCode::Pop, SPAN);
+        chunk.write_instruction(OpCode::Constant(then_value), SPAN);
+        chunk.write_instruction(OpCode::Jump(JumpOffset::new(2)), SPAN);
+        chunk.write_instruction(OpCode::Pop, SPAN);
+        chunk.write_instruction(OpCode::Constant(else_value), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::String("else".to_owned())));
+    }
+
+    #[test]
+    fn executes_manual_loop_bytecode() {
+        let mut chunk = Chunk::new();
+        let name = chunk
+            .add_constant(Value::String("counter".to_owned()))
+            .unwrap();
+        let zero = chunk.add_constant(Value::Int(0)).unwrap();
+        let three = chunk.add_constant(Value::Int(3)).unwrap();
+        let one = chunk.add_constant(Value::Int(1)).unwrap();
+
+        chunk.write_instruction(OpCode::Constant(zero), SPAN);
+        chunk.write_instruction(OpCode::DefineGlobal(name), SPAN);
+        chunk.write_instruction(OpCode::GetGlobal(name), SPAN);
+        chunk.write_instruction(OpCode::Constant(three), SPAN);
+        chunk.write_instruction(OpCode::Less, SPAN);
+        chunk.write_instruction(OpCode::JumpIfFalse(JumpOffset::new(7)), SPAN);
+        chunk.write_instruction(OpCode::Pop, SPAN);
+        chunk.write_instruction(OpCode::GetGlobal(name), SPAN);
+        chunk.write_instruction(OpCode::Constant(one), SPAN);
+        chunk.write_instruction(OpCode::Add, SPAN);
+        chunk.write_instruction(OpCode::SetGlobal(name), SPAN);
+        chunk.write_instruction(OpCode::Pop, SPAN);
+        chunk.write_instruction(OpCode::Loop(JumpOffset::new(11)), SPAN);
+        chunk.write_instruction(OpCode::Pop, SPAN);
+        chunk.write_instruction(OpCode::GetGlobal(name), SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&chunk), Ok(Value::Int(3)));
     }
 
     #[test]

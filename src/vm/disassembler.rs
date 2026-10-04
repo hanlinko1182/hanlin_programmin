@@ -6,7 +6,8 @@
 use std::fmt;
 use std::fmt::Write;
 
-use super::{Chunk, ConstantIndex, LocalSlot, OpCode, Value};
+use super::opcode::{resolve_jump_target, JumpDirection};
+use super::{Chunk, ConstantIndex, JumpOffset, LocalSlot, OpCode, Value};
 
 /// An error found while disassembling a bytecode chunk.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,6 +24,12 @@ pub enum DisassembleError {
     InvalidGlobalName {
         offset: usize,
         index: u32,
+    },
+    InvalidJumpTarget {
+        offset: usize,
+        opcode: OpCode,
+        target: Option<usize>,
+        instruction_count: usize,
     },
 }
 
@@ -48,6 +55,22 @@ impl fmt::Display for DisassembleError {
                 f,
                 "instruction {offset} references constant index {index} as a global name, but it is not a string"
             ),
+            Self::InvalidJumpTarget {
+                offset,
+                opcode,
+                target,
+                instruction_count,
+            } => {
+                write!(f, "invalid {opcode:?} target at instruction {offset}")?;
+                if let Some(target) = target {
+                    write!(
+                        f,
+                        ": target {target} is outside the chunk's {instruction_count} instructions"
+                    )
+                } else {
+                    write!(f, ": target arithmetic overflowed or underflowed")
+                }
+            }
         }
     }
 }
@@ -89,12 +112,53 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> Result<String, D
         OpCode::GetLocal(slot) | OpCode::SetLocal(slot) => {
             Ok(format_local_instruction(offset, &span, name, slot))
         }
+        OpCode::Jump(jump_offset) | OpCode::JumpIfFalse(jump_offset) => format_jump_instruction(
+            chunk,
+            offset,
+            &span,
+            name,
+            opcode,
+            jump_offset,
+            JumpDirection::Forward,
+        ),
+        OpCode::Loop(jump_offset) => format_jump_instruction(
+            chunk,
+            offset,
+            &span,
+            name,
+            opcode,
+            jump_offset,
+            JumpDirection::Backward,
+        ),
         _ => Ok(format!("{offset:04}  {span:<6} {name}")),
     }
 }
 
 fn format_local_instruction(offset: usize, span: &str, name: &str, slot: LocalSlot) -> String {
     format!("{offset:04}  {span:<6} {name:<14} {}", slot.as_u16())
+}
+
+fn format_jump_instruction(
+    chunk: &Chunk,
+    offset: usize,
+    span: &str,
+    name: &str,
+    opcode: OpCode,
+    jump_offset: JumpOffset,
+    direction: JumpDirection,
+) -> Result<String, DisassembleError> {
+    let target = resolve_jump_target(offset, jump_offset, direction, chunk.instructions().len())
+        .map_err(|error| DisassembleError::InvalidJumpTarget {
+            offset,
+            opcode,
+            target: error.target,
+            instruction_count: chunk.instructions().len(),
+        })?;
+
+    Ok(format!(
+        "{offset:04}  {span:<6} {name:<16} {} -> {target}",
+        jump_offset.as_u16()
+    ))
 }
 
 fn format_indexed_instruction(
@@ -151,6 +215,9 @@ fn opcode_name(opcode: OpCode) -> &'static str {
         OpCode::DefineGlobal(_) => "DEFINE_GLOBAL",
         OpCode::GetGlobal(_) => "GET_GLOBAL",
         OpCode::SetGlobal(_) => "SET_GLOBAL",
+        OpCode::Jump(_) => "JUMP",
+        OpCode::JumpIfFalse(_) => "JUMP_IF_FALSE",
+        OpCode::Loop(_) => "LOOP",
         OpCode::Return => "RETURN",
     }
 }
@@ -169,7 +236,7 @@ fn format_constant(value: &Value) -> String {
 mod tests {
     use super::{disassemble_chunk, disassemble_instruction, DisassembleError};
     use crate::error::Span;
-    use crate::vm::{Chunk, ConstantIndex, LocalSlot, OpCode, Value};
+    use crate::vm::{Chunk, ConstantIndex, JumpOffset, LocalSlot, OpCode, Value};
 
     fn chunk_with(opcodes: &[OpCode]) -> Chunk {
         let mut chunk = Chunk::new();
@@ -412,6 +479,66 @@ mod tests {
         assert_eq!(
             disassemble_instruction(&chunk, 0).unwrap(),
             "0000  1:5    SET_LOCAL      1"
+        );
+    }
+
+    #[test]
+    fn disassembles_forward_jump_with_resolved_target() {
+        let chunk = chunk_with(&[
+            OpCode::Jump(JumpOffset::new(2)),
+            OpCode::Null,
+            OpCode::Null,
+            OpCode::Return,
+        ]);
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0).unwrap(),
+            "0000  1:1    JUMP             2 -> 3"
+        );
+    }
+
+    #[test]
+    fn disassembles_conditional_jump_with_resolved_target() {
+        let chunk = chunk_with(&[
+            OpCode::True,
+            OpCode::JumpIfFalse(JumpOffset::new(1)),
+            OpCode::Null,
+            OpCode::Return,
+        ]);
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 1).unwrap(),
+            "0001  1:2    JUMP_IF_FALSE    1 -> 3"
+        );
+    }
+
+    #[test]
+    fn disassembles_loop_with_resolved_target() {
+        let chunk = chunk_with(&[
+            OpCode::Null,
+            OpCode::Return,
+            OpCode::Loop(JumpOffset::new(2)),
+        ]);
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 2).unwrap(),
+            "0002  1:3    LOOP             2 -> 1"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_jump_target() {
+        let opcode = OpCode::Jump(JumpOffset::new(1));
+        let chunk = chunk_with(&[opcode, OpCode::Return]);
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0),
+            Err(DisassembleError::InvalidJumpTarget {
+                offset: 0,
+                opcode,
+                target: Some(2),
+                instruction_count: 2,
+            })
         );
     }
 
