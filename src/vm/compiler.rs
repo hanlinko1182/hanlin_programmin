@@ -1081,6 +1081,14 @@ mod tests {
         read_global(&mut vm, name)
     }
 
+    fn run_source_and_format(source: &str, name: &str) -> String {
+        let chunk = compile_source(source).unwrap();
+        let mut vm = Vm::new();
+        assert_eq!(vm.run(&chunk), Ok(Value::Null));
+        let value = read_global(&mut vm, name);
+        vm.format_value(&value).unwrap()
+    }
+
     fn read_global(vm: &mut Vm, name: &str) -> Value {
         let mut read = Chunk::new();
         let name = read.add_constant(Value::String(name.to_owned())).unwrap();
@@ -2818,7 +2826,7 @@ mod tests {
     #[test]
     fn compiles_object_literal() {
         assert_eq!(
-            run_source_and_get("let result = { value: 1 };", "result").to_string(),
+            run_source_and_format("let result = { value: 1 };", "result"),
             "{ value: 1 }"
         );
     }
@@ -2913,16 +2921,13 @@ mod tests {
 
     #[test]
     fn builds_empty_array() {
-        assert_eq!(
-            run_source_and_get("let result = [];", "result").to_string(),
-            "[]"
-        );
+        assert_eq!(run_source_and_format("let result = [];", "result"), "[]");
     }
 
     #[test]
     fn builds_integer_array_in_source_order() {
         assert_eq!(
-            run_source_and_get("let result = [1, 2, 3];", "result").to_string(),
+            run_source_and_format("let result = [1, 2, 3];", "result"),
             "[1, 2, 3]"
         );
     }
@@ -2930,7 +2935,7 @@ mod tests {
     #[test]
     fn builds_mixed_value_array() {
         assert_eq!(
-            run_source_and_get("let result = [1, \"two\", true, null];", "result").to_string(),
+            run_source_and_format("let result = [1, \"two\", true, null];", "result"),
             "[1, \"two\", true, null]"
         );
     }
@@ -2938,7 +2943,7 @@ mod tests {
     #[test]
     fn builds_nested_array() {
         assert_eq!(
-            run_source_and_get("let result = [[1], [2, 3]];", "result").to_string(),
+            run_source_and_format("let result = [[1], [2, 3]];", "result"),
             "[[1], [2, 3]]"
         );
     }
@@ -2958,11 +2963,10 @@ mod tests {
             Value::Int(9)
         );
         assert_eq!(
-            run_source_and_get(
+            run_source_and_format(
                 "let values = [1]; values[0] = 9; let result = values;",
                 "result"
-            )
-            .to_string(),
+            ),
             "[9]"
         );
     }
@@ -2982,7 +2986,7 @@ mod tests {
     #[test]
     fn array_can_be_returned_from_function() {
         let source = "fn make() { return [3, 4]; } let result = make();";
-        assert_eq!(run_source_and_get(source, "result").to_string(), "[3, 4]");
+        assert_eq!(run_source_and_format(source, "result"), "[3, 4]");
     }
 
     #[test]
@@ -2997,17 +3001,14 @@ mod tests {
 
     #[test]
     fn builds_empty_object() {
-        assert_eq!(
-            run_source_and_get("let result = {};", "result").to_string(),
-            "{  }"
-        );
+        assert_eq!(run_source_and_format("let result = {};", "result"), "{  }");
     }
 
     #[test]
     fn builds_object_with_deterministic_display() {
         let source = "let result = { name: \"Han\", age: 20 };";
         assert_eq!(
-            run_source_and_get(source, "result").to_string(),
+            run_source_and_format(source, "result"),
             "{ age: 20, name: \"Han\" }"
         );
     }
@@ -3063,10 +3064,7 @@ mod tests {
     #[test]
     fn object_can_be_returned_from_function() {
         let source = "fn make() { return { value: 7 }; } let result = make();";
-        assert_eq!(
-            run_source_and_get(source, "result").to_string(),
-            "{ value: 7 }"
-        );
+        assert_eq!(run_source_and_format(source, "result"), "{ value: 7 }");
     }
 
     #[test]
@@ -3157,7 +3155,7 @@ mod tests {
     fn vm_matches_interpreter_for_array_behavior() {
         let source = "let values = [1, 2]; values[1] = 9; let result = values;";
         assert_eq!(
-            run_source_and_get(source, "result").to_string(),
+            run_source_and_format(source, "result"),
             interpreter_global(source, "result")
         );
     }
@@ -3166,7 +3164,7 @@ mod tests {
     fn vm_matches_interpreter_for_object_behavior() {
         let source = "let user = { name: \"Han\" }; user.age = 20; let result = user;";
         assert_eq!(
-            run_source_and_get(source, "result").to_string(),
+            run_source_and_format(source, "result"),
             interpreter_global(source, "result")
         );
     }

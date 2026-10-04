@@ -22,8 +22,8 @@ pub use closure::Closure;
 pub use compiler::{CompileError, Compiler, MAX_UPVALUES};
 pub use disassembler::{disassemble_chunk, disassemble_instruction, DisassembleError};
 pub use function::{Function, UpvalueDescriptor};
-pub use heap_object::{HeapObject, HeapObjectRef};
-pub use machine::{Vm, VmError, MAX_CALL_FRAMES};
+pub use heap_object::{GcStats, Heap, HeapError, HeapObject, HeapRef};
+pub use machine::{Vm, VmError, MAX_CALL_FRAMES, MIN_GC_THRESHOLD};
 pub use opcode::{
     AggregateCount, AggregateCountError, Arity, ArityError, ConstantIndex, JumpOffset,
     JumpOffsetError, LocalSlot, LocalSlotError, OpCode, UpvalueIndex, UpvalueIndexError,

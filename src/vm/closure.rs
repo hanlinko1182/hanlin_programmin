@@ -42,6 +42,10 @@ impl Closure {
     pub(crate) fn upvalue(&self, index: usize) -> Option<&Upvalue> {
         self.upvalues.get(index)
     }
+
+    pub(crate) fn upvalues(&self) -> &[Upvalue] {
+        &self.upvalues
+    }
 }
 
 impl fmt::Debug for Closure {

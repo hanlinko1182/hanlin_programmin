@@ -17,12 +17,14 @@ use crate::error::Span;
 use super::closure::{Upvalue, UpvalueState};
 use super::opcode::{resolve_jump_target, JumpDirection};
 use super::{
-    AggregateCount, Arity, Chunk, Closure, ConstantIndex, Function, HeapObject, JumpOffset,
-    LocalSlot, OpCode, UpvalueDescriptor, UpvalueIndex, Value,
+    AggregateCount, Arity, Chunk, Closure, ConstantIndex, Function, GcStats, Heap, HeapError,
+    HeapObject, JumpOffset, LocalSlot, OpCode, UpvalueDescriptor, UpvalueIndex, Value,
 };
 
 /// Maximum number of active Hanlin function calls, excluding the script frame.
 pub const MAX_CALL_FRAMES: usize = 1024;
+/// Small object-count floor for the VM-15 automatic collector.
+pub const MIN_GC_THRESHOLD: usize = 8;
 
 /// A structured failure encountered while executing Hanlin bytecode.
 #[derive(Clone, Debug, PartialEq)]
@@ -163,6 +165,11 @@ pub enum VmError {
     InvalidMapKey {
         instruction_offset: usize,
         key: Value,
+        span: Span,
+    },
+    HeapAccess {
+        instruction_offset: usize,
+        error: HeapError,
         span: Span,
     },
 }
@@ -410,6 +417,14 @@ impl fmt::Display for VmError {
                 f,
                 "map/object index must be a string at instruction {instruction_offset} ({span}), got {key:?}"
             ),
+            Self::HeapAccess {
+                instruction_offset,
+                error,
+                span,
+            } => write!(
+                f,
+                "heap access failed at instruction {instruction_offset} ({span}): {error}"
+            ),
         }
     }
 }
@@ -427,6 +442,9 @@ pub struct Vm {
     frames: Vec<CallFrame>,
     open_upvalues: Vec<Upvalue>,
     globals: HashMap<String, Value>,
+    heap: Heap,
+    next_gc: usize,
+    minimum_gc_threshold: usize,
 }
 
 #[derive(Debug)]
@@ -444,7 +462,50 @@ impl Vm {
             frames: Vec::new(),
             open_upvalues: Vec::new(),
             globals: HashMap::new(),
+            heap: Heap::new(),
+            next_gc: MIN_GC_THRESHOLD,
+            minimum_gc_threshold: MIN_GC_THRESHOLD,
         }
+    }
+
+    /// Formats a value using this VM's heap for aggregate dereferencing.
+    pub fn format_value(&self, value: &Value) -> Result<String, HeapError> {
+        self.heap.format_value(value)
+    }
+
+    pub const fn heap_live_count(&self) -> usize {
+        self.heap.live_count()
+    }
+
+    pub fn heap_capacity(&self) -> usize {
+        self.heap.capacity()
+    }
+
+    pub const fn gc_threshold(&self) -> usize {
+        self.next_gc
+    }
+
+    /// Overrides the object-count trigger. Primarily useful for deterministic
+    /// stress tests; subsequent collections still apply the live*2 policy.
+    pub fn set_gc_threshold(&mut self, threshold: usize) {
+        let threshold = threshold.max(1);
+        self.minimum_gc_threshold = threshold;
+        self.next_gc = threshold;
+    }
+
+    /// Runs a full collection over stack, globals, frames, and upvalues.
+    pub fn collect_garbage(&mut self) -> Result<GcStats, HeapError> {
+        let mut roots = self.stack.clone();
+        roots.extend(self.globals.values().cloned());
+        roots.extend(
+            self.frames
+                .iter()
+                .map(|frame| Value::Closure(Rc::clone(&frame.closure))),
+        );
+        let upvalues = self.open_upvalues.clone();
+        let stats = self.heap.collect(&roots, &self.stack, &upvalues)?;
+        self.next_gc = stats.after.saturating_mul(2).max(self.minimum_gc_threshold);
+        Ok(stats)
     }
 
     /// Executes `chunk` until `Return` or a structured [`VmError`].
@@ -628,8 +689,17 @@ impl Vm {
                 span,
             });
         }
+        self.maybe_collect_for_allocation(instruction_offset, span)?;
         let elements = self.stack.split_off(available - needed);
-        self.stack.push(Value::array(elements));
+        let reference = self
+            .heap
+            .allocate(HeapObject::Array(elements))
+            .map_err(|error| VmError::HeapAccess {
+                instruction_offset,
+                error,
+                span,
+            })?;
+        self.stack.push(Value::Heap(reference));
         Ok(())
     }
 
@@ -650,6 +720,7 @@ impl Vm {
                 span,
             });
         }
+        self.maybe_collect_for_allocation(instruction_offset, span)?;
         let start = available - needed;
         for pair in self.stack[start..].as_chunks::<2>().0 {
             if !matches!(pair[0], Value::String(_)) {
@@ -671,7 +742,15 @@ impl Vm {
             };
             entries.insert(key, value);
         }
-        self.stack.push(Value::map(entries));
+        let reference = self
+            .heap
+            .allocate(HeapObject::Map(entries))
+            .map_err(|error| VmError::HeapAccess {
+                instruction_offset,
+                error,
+                span,
+            })?;
+        self.stack.push(Value::Heap(reference));
         Ok(())
     }
 
@@ -680,23 +759,32 @@ impl Vm {
         let index = self.stack.pop().expect("stack depth was validated");
         let target = self.stack.pop().expect("stack depth was validated");
 
-        let result = match &target {
-            Value::Heap(object) => match &*object.borrow() {
-                HeapObject::Array(elements) => {
-                    let index = Self::integer_index(index, instruction_offset, span)?;
-                    Self::checked_element(elements, index, false, instruction_offset, span)?
+        let result = match target {
+            Value::Heap(reference) => {
+                match self
+                    .heap
+                    .get(reference)
+                    .map_err(|error| VmError::HeapAccess {
+                        instruction_offset,
+                        error,
+                        span,
+                    })? {
+                    HeapObject::Array(elements) => {
+                        let index = Self::integer_index(index, instruction_offset, span)?;
+                        Self::checked_element(elements, index, false, instruction_offset, span)?
+                    }
+                    HeapObject::Map(entries) => {
+                        let Value::String(key) = index else {
+                            return Err(VmError::InvalidMapKey {
+                                instruction_offset,
+                                key: index,
+                                span,
+                            });
+                        };
+                        entries.get(&key).cloned().unwrap_or(Value::Null)
+                    }
                 }
-                HeapObject::Map(entries) => {
-                    let Value::String(key) = index else {
-                        return Err(VmError::InvalidMapKey {
-                            instruction_offset,
-                            key: index,
-                            span,
-                        });
-                    };
-                    entries.get(&key).cloned().unwrap_or(Value::Null)
-                }
-            },
+            }
             Value::String(value) => {
                 let index = Self::integer_index(index, instruction_offset, span)?;
                 let characters: Vec<char> = value.chars().collect();
@@ -723,34 +811,44 @@ impl Vm {
         let index = self.stack.pop().expect("stack depth was validated");
         let target = self.stack.pop().expect("stack depth was validated");
 
-        match &target {
-            Value::Heap(object) => match &mut *object.borrow_mut() {
-                HeapObject::Array(elements) => {
-                    let index = Self::integer_index(index, instruction_offset, span)?;
-                    let length = elements.len();
-                    let element = elements.get_mut(usize::try_from(index).unwrap_or(usize::MAX));
-                    let Some(element) = element else {
-                        return Err(VmError::IndexOutOfBounds {
-                            instruction_offset,
-                            index,
-                            length,
-                            assignment: true,
-                            span,
-                        });
-                    };
-                    *element = value.clone();
+        match target {
+            Value::Heap(reference) => {
+                match self
+                    .heap
+                    .get_mut(reference)
+                    .map_err(|error| VmError::HeapAccess {
+                        instruction_offset,
+                        error,
+                        span,
+                    })? {
+                    HeapObject::Array(elements) => {
+                        let index = Self::integer_index(index, instruction_offset, span)?;
+                        let length = elements.len();
+                        let element =
+                            elements.get_mut(usize::try_from(index).unwrap_or(usize::MAX));
+                        let Some(element) = element else {
+                            return Err(VmError::IndexOutOfBounds {
+                                instruction_offset,
+                                index,
+                                length,
+                                assignment: true,
+                                span,
+                            });
+                        };
+                        *element = value.clone();
+                    }
+                    HeapObject::Map(entries) => {
+                        let Value::String(key) = index else {
+                            return Err(VmError::InvalidMapKey {
+                                instruction_offset,
+                                key: index,
+                                span,
+                            });
+                        };
+                        entries.insert(key, value.clone());
+                    }
                 }
-                HeapObject::Map(entries) => {
-                    let Value::String(key) = index else {
-                        return Err(VmError::InvalidMapKey {
-                            instruction_offset,
-                            key: index,
-                            span,
-                        });
-                    };
-                    entries.insert(key, value.clone());
-                }
-            },
+            }
             _ => {
                 return Err(VmError::InvalidIndexTarget {
                     instruction_offset,
@@ -761,6 +859,26 @@ impl Vm {
             }
         }
         self.stack.push(value);
+        Ok(())
+    }
+
+    /// Automatic collection is a pre-allocation safe point: every child value
+    /// for BUILD_ARRAY/BUILD_MAP is still on the operand stack. Allocation and
+    /// pushing the resulting handle then happen without another collection, so
+    /// no separate temporary-root guard is required.
+    fn maybe_collect_for_allocation(
+        &mut self,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        if self.heap.live_count() >= self.next_gc {
+            self.collect_garbage()
+                .map_err(|error| VmError::HeapAccess {
+                    instruction_offset,
+                    error,
+                    span,
+                })?;
+        }
         Ok(())
     }
 
@@ -1332,7 +1450,7 @@ impl Vm {
             (Value::Int(left), Value::Float(right)) => *left as f64 == *right,
             (Value::Float(left), Value::Int(right)) => *left == *right as f64,
             (Value::String(left), Value::String(right)) => left == right,
-            (Value::Heap(left), Value::Heap(right)) => Rc::ptr_eq(left, right),
+            (Value::Heap(left), Value::Heap(right)) => left == right,
             _ => false,
         }
     }
@@ -1647,9 +1765,11 @@ mod tests {
 
     use super::{Vm, VmError};
     use crate::error::Span;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
     use crate::vm::{
-        AggregateCount, Arity, Chunk, ConstantIndex, Function, JumpOffset, LocalSlot, OpCode,
-        UpvalueDescriptor, UpvalueIndex, Value,
+        AggregateCount, Arity, Chunk, Compiler, ConstantIndex, Function, HeapError, HeapObject,
+        HeapRef, JumpOffset, LocalSlot, OpCode, UpvalueDescriptor, UpvalueIndex, Value,
     };
 
     const SPAN: Span = Span { line: 1, col: 1 };
@@ -1691,6 +1811,20 @@ mod tests {
         chunk.write_instruction(opcode, SPAN);
         chunk.write_instruction(OpCode::Return, SPAN);
         chunk
+    }
+
+    fn compile_source(source: &str) -> Chunk {
+        let tokens = Lexer::new(source).tokenize().unwrap();
+        let program = Parser::new(tokens).parse().unwrap();
+        Compiler::new().compile(&program).unwrap()
+    }
+
+    fn run_source(vm: &mut Vm, source: &str) -> Value {
+        vm.run(&compile_source(source)).unwrap()
+    }
+
+    fn read_global_value(vm: &mut Vm, name: &str) -> Value {
+        vm.run(&get_global_chunk(name)).unwrap()
     }
 
     fn negate_chunk(value: Value) -> Chunk {
@@ -3605,7 +3739,9 @@ mod tests {
         chunk.write_instruction(OpCode::BuildArray(AggregateCount::new(3)), SPAN);
         chunk.write_instruction(OpCode::Return, SPAN);
 
-        assert_eq!(Vm::new().run(&chunk).unwrap().to_string(), "[1, 2, 3]");
+        let mut vm = Vm::new();
+        let value = vm.run(&chunk).unwrap();
+        assert_eq!(vm.format_value(&value).unwrap(), "[1, 2, 3]");
     }
 
     #[test]
@@ -3666,5 +3802,193 @@ mod tests {
                 span: SPAN,
             })
         );
+    }
+
+    #[test]
+    fn explicit_gc_preserves_global_and_collects_unrooted_object() {
+        let mut vm = Vm::new();
+        run_source(
+            &mut vm,
+            "let kept = [1]; let garbage = [2]; garbage = null;",
+        );
+        assert_eq!(vm.heap_live_count(), 2);
+        let stats = vm.collect_garbage().unwrap();
+        assert_eq!(stats.after, 1);
+        let kept = read_global_value(&mut vm, "kept");
+        assert_eq!(vm.format_value(&kept).unwrap(), "[1]");
+    }
+
+    #[test]
+    fn removing_final_global_root_allows_collection() {
+        let mut vm = Vm::new();
+        run_source(&mut vm, "let kept = [1];");
+        run_source(&mut vm, "kept = null;");
+        assert_eq!(vm.collect_garbage().unwrap().after, 0);
+    }
+
+    #[test]
+    fn operand_stack_value_survives_explicit_gc() {
+        let mut vm = Vm::new();
+        let reference = vm.heap.allocate(HeapObject::Array(Vec::new())).unwrap();
+        vm.stack.push(Value::Heap(reference));
+        assert_eq!(vm.collect_garbage().unwrap().after, 1);
+        assert!(vm.heap.get(reference).is_ok());
+    }
+
+    #[test]
+    fn automatic_gc_triggers_at_object_threshold() {
+        let mut vm = Vm::new();
+        vm.set_gc_threshold(1);
+        run_source(&mut vm, "[]; []; []; []; [];");
+        assert_eq!(vm.heap_live_count(), 1);
+        assert_eq!(vm.heap_capacity(), 1);
+        assert_eq!(vm.gc_threshold(), 1);
+    }
+
+    #[test]
+    fn low_threshold_preserves_nested_allocation_operands() {
+        let mut vm = Vm::new();
+        vm.set_gc_threshold(1);
+        run_source(&mut vm, "let root = [[[1]], [[2]], [[3]]];");
+        let root = read_global_value(&mut vm, "root");
+        assert_eq!(vm.format_value(&root).unwrap(), "[[[1]], [[2]], [[3]]]");
+    }
+
+    #[test]
+    fn function_argument_aggregate_survives_gc_during_call() {
+        let mut vm = Vm::new();
+        vm.set_gc_threshold(1);
+        run_source(
+            &mut vm,
+            "fn keep(value) { let temp = []; return value[0]; } let result = keep([42]);",
+        );
+        assert_eq!(read_global_value(&mut vm, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn function_local_aggregate_survives_gc_during_call() {
+        let mut vm = Vm::new();
+        vm.set_gc_threshold(1);
+        run_source(
+            &mut vm,
+            "fn keep() { let value = [42]; let temp = []; return value[0]; } let result = keep();",
+        );
+        assert_eq!(read_global_value(&mut vm, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn returned_aggregate_survives_after_caller_receives_it() {
+        let mut vm = Vm::new();
+        vm.set_gc_threshold(1);
+        run_source(
+            &mut vm,
+            "fn make() { return [42]; } let returned = make(); let temp = []; let result = returned[0];",
+        );
+        assert_eq!(read_global_value(&mut vm, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn closed_upvalue_aggregate_survives_explicit_collection() {
+        let mut vm = Vm::new();
+        run_source(
+            &mut vm,
+            concat!(
+                "fn make() { let values = [42]; ",
+                "fn get() { return values[0]; } return get; } let get = make();"
+            ),
+        );
+        vm.collect_garbage().unwrap();
+        run_source(&mut vm, "let result = get();");
+        assert_eq!(read_global_value(&mut vm, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn captured_map_survives_collection_between_invocations() {
+        let mut vm = Vm::new();
+        run_source(
+            &mut vm,
+            concat!(
+                "fn make() { let value = { answer: 42 }; ",
+                "fn get() { return value.answer; } return get; } let get = make();"
+            ),
+        );
+        vm.collect_garbage().unwrap();
+        run_source(&mut vm, "let result = get();");
+        assert_eq!(read_global_value(&mut vm, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn alias_identity_and_mutation_survive_collection() {
+        let mut vm = Vm::new();
+        run_source(&mut vm, "let a = [1]; let b = a;");
+        vm.collect_garbage().unwrap();
+        run_source(&mut vm, "b[0] = 9; let result = a[0];");
+        assert_eq!(read_global_value(&mut vm, "result"), Value::Int(9));
+    }
+
+    #[test]
+    fn recursion_with_allocations_survives_aggressive_gc() {
+        let mut vm = Vm::new();
+        vm.set_gc_threshold(1);
+        run_source(
+            &mut vm,
+            concat!(
+                "fn descend(n, kept) { let temp = []; ",
+                "if (n == 0) { return kept[0]; } return descend(n - 1, kept); } ",
+                "let result = descend(20, [42]);"
+            ),
+        );
+        assert_eq!(read_global_value(&mut vm, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn stale_heap_reference_becomes_structured_vm_error() {
+        let mut vm = Vm::new();
+        let stale = vm.heap.allocate(HeapObject::Array(Vec::new())).unwrap();
+        vm.collect_garbage().unwrap();
+        let mut chunk = Chunk::new();
+        let target = chunk.add_constant(Value::Heap(stale)).unwrap();
+        let index = chunk.add_constant(Value::Int(0)).unwrap();
+        chunk.write_instruction(OpCode::Constant(target), SPAN);
+        chunk.write_instruction(OpCode::Constant(index), SPAN);
+        chunk.write_instruction(OpCode::GetIndex, SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+        assert!(matches!(
+            vm.run(&chunk),
+            Err(VmError::HeapAccess {
+                error: HeapError::StaleReference { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn slot_reuse_keeps_language_identity_distinct() {
+        let mut vm = Vm::new();
+        let old = vm.heap.allocate(HeapObject::Array(Vec::new())).unwrap();
+        vm.collect_garbage().unwrap();
+        let new = vm.heap.allocate(HeapObject::Array(Vec::new())).unwrap();
+        assert_eq!(old.slot(), new.slot());
+        assert_ne!(Value::Heap(old), Value::Heap(new));
+    }
+
+    #[test]
+    fn invalid_heap_reference_is_structured_at_runtime() {
+        let mut vm = Vm::new();
+        let invalid = HeapRef::new(99, 0);
+        let mut chunk = Chunk::new();
+        let target = chunk.add_constant(Value::Heap(invalid)).unwrap();
+        let index = chunk.add_constant(Value::Int(0)).unwrap();
+        chunk.write_instruction(OpCode::Constant(target), SPAN);
+        chunk.write_instruction(OpCode::Constant(index), SPAN);
+        chunk.write_instruction(OpCode::GetIndex, SPAN);
+        chunk.write_instruction(OpCode::Return, SPAN);
+        assert!(matches!(
+            vm.run(&chunk),
+            Err(VmError::HeapAccess {
+                error: HeapError::InvalidReference { .. },
+                ..
+            })
+        ));
     }
 }
