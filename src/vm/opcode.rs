@@ -65,6 +65,61 @@ impl fmt::Display for ArityError {
 
 impl std::error::Error for ArityError {}
 
+/// An index into a closure's bounded upvalue array.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct UpvalueIndex(u8);
+
+impl UpvalueIndex {
+    pub const MAX: Self = Self(u8::MAX);
+
+    pub const fn new(index: u8) -> Self {
+        Self(index)
+    }
+
+    pub const fn as_u8(self) -> u8 {
+        self.0
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl TryFrom<usize> for UpvalueIndex {
+    type Error = UpvalueIndexError;
+
+    fn try_from(index: usize) -> Result<Self, Self::Error> {
+        u8::try_from(index)
+            .map(Self::new)
+            .map_err(|_| UpvalueIndexError { index })
+    }
+}
+
+/// A platform-sized capture index that cannot fit in [`UpvalueIndex`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpvalueIndexError {
+    index: usize,
+}
+
+impl UpvalueIndexError {
+    pub const fn index(self) -> usize {
+        self.index
+    }
+}
+
+impl fmt::Display for UpvalueIndexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "upvalue index {} exceeds the maximum supported index {}",
+            self.index,
+            UpvalueIndex::MAX.as_u8()
+        )
+    }
+}
+
+impl std::error::Error for UpvalueIndexError {}
+
 /// An index into a [`Chunk`](super::chunk::Chunk)'s constant pool.
 ///
 /// The explicit width prevents a future bytecode encoder from accidentally
@@ -255,7 +310,7 @@ pub(crate) fn resolve_jump_target(
 /// A single operation understood by Hanlin's future stack-based VM.
 ///
 /// Variants carry their operands directly. This keeps constant indexes, local
-/// slots, jump distances, and call arities strongly typed.
+/// slots, upvalue indexes, jump distances, and call arities strongly typed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpCode {
     Constant(ConstantIndex),
@@ -284,13 +339,29 @@ pub enum OpCode {
     Jump(JumpOffset),
     JumpIfFalse(JumpOffset),
     Loop(JumpOffset),
+    Closure(ConstantIndex),
+    GetUpvalue(UpvalueIndex),
+    SetUpvalue(UpvalueIndex),
+    CloseUpvalue(LocalSlot),
     Call(Arity),
     Return,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Arity, ArityError, JumpOffset, JumpOffsetError, LocalSlot, LocalSlotError};
+    use super::{
+        Arity, ArityError, JumpOffset, JumpOffsetError, LocalSlot, LocalSlotError, UpvalueIndex,
+        UpvalueIndexError,
+    };
+
+    #[test]
+    fn constructs_and_checks_upvalue_index() {
+        assert_eq!(UpvalueIndex::new(7).as_usize(), 7);
+        let attempted = usize::from(u8::MAX) + 1;
+        let error = UpvalueIndex::try_from(attempted).unwrap_err();
+        assert_eq!(error, UpvalueIndexError { index: attempted });
+        assert_eq!(error.index(), attempted);
+    }
 
     #[test]
     fn constructs_valid_arity() {

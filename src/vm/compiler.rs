@@ -1,22 +1,26 @@
 //! AST-to-bytecode compiler for Hanlin's stack VM.
 //!
 //! The compiler supports primitive expressions, globals, control flow,
-//! short-circuit logical expressions, and named functions with frame-local
-//! parameters and variables. Supported expression nodes do not carry source
-//! spans in the current AST, so their containing statement's span is applied
-//! to every instruction they emit. An empty program uses [`EMPTY_PROGRAM_SPAN`]
-//! for its synthetic `Null` and `Return` instructions.
+//! short-circuit logical expressions, and named closures with frame-local
+//! parameters, variables, and lexical upvalues. Supported expression nodes do
+//! not carry source spans in the current AST, so their containing statement's
+//! span is applied to every instruction they emit. An empty program uses
+//! [`EMPTY_PROGRAM_SPAN`] for its synthetic `Null` and `Return` instructions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
 use crate::ast::{BinOp, Expr, Literal, Program, Stmt, UnOp};
 use crate::error::Span;
 
-use super::{Arity, Chunk, ChunkError, Function, JumpOffset, LocalSlot, OpCode, Value};
+use super::{
+    Arity, Chunk, ChunkError, Function, JumpOffset, LocalSlot, OpCode, UpvalueDescriptor,
+    UpvalueIndex, Value,
+};
 
 const EMPTY_PROGRAM_SPAN: Span = Span { line: 1, col: 1 };
+pub const MAX_UPVALUES: usize = u8::MAX as usize;
 
 /// A structured failure produced while lowering Hanlin AST into bytecode.
 #[derive(Clone, Debug, PartialEq)]
@@ -42,7 +46,7 @@ pub enum CompileError {
     ReturnOutsideFunction {
         span: Span,
     },
-    NestedFunctionUnsupported {
+    NestedFunctionRecursionUnsupported {
         name: String,
         span: Span,
     },
@@ -62,6 +66,12 @@ pub enum CompileError {
         span: Span,
     },
     TooManyLocals {
+        function: String,
+        count: usize,
+        maximum: usize,
+        span: Span,
+    },
+    TooManyUpvalues {
         function: String,
         count: usize,
         maximum: usize,
@@ -101,9 +111,9 @@ impl fmt::Display for CompileError {
             Self::ReturnOutsideFunction { span } => {
                 write!(f, "return outside a function at {span}")
             }
-            Self::NestedFunctionUnsupported { name, span } => write!(
+            Self::NestedFunctionRecursionUnsupported { name, span } => write!(
                 f,
-                "nested function declaration '{name}' is unsupported without closures at {span}"
+                "self-recursive nested function '{name}' is unsupported at {span}"
             ),
             Self::BlockLocalUnsupported { name, span } => write!(
                 f,
@@ -134,6 +144,15 @@ impl fmt::Display for CompileError {
             } => write!(
                 f,
                 "function '{function}' needs {count} local slots, exceeding the maximum {maximum} at {span}"
+            ),
+            Self::TooManyUpvalues {
+                function,
+                count,
+                maximum,
+                span,
+            } => write!(
+                f,
+                "function '{function}' captures {count} upvalues, exceeding the maximum {maximum} at {span}"
             ),
             Self::JumpTooLarge { distance, span } => write!(
                 f,
@@ -172,33 +191,43 @@ struct LoopContext {
 #[derive(Debug)]
 struct FunctionContext {
     name: String,
+    nested: bool,
     locals: HashMap<String, LocalSlot>,
+    nested_function_names: HashSet<String>,
+    upvalues: Vec<UpvalueDescriptor>,
     next_slot: usize,
     block_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedVariable {
+    Local(LocalSlot),
+    Upvalue(UpvalueIndex),
+    Global,
 }
 
 /// Compiles the supported subset of Hanlin's existing AST into a [`Chunk`].
 #[derive(Debug, Default)]
 pub struct Compiler {
     loop_contexts: Vec<LoopContext>,
-    function_context: Option<FunctionContext>,
+    function_contexts: Vec<FunctionContext>,
 }
 
 impl Compiler {
     pub const fn new() -> Self {
         Self {
             loop_contexts: Vec::new(),
-            function_context: None,
+            function_contexts: Vec::new(),
         }
     }
 
     /// Compiles a top-level program and always emits explicit termination.
     pub fn compile(&mut self, program: &Program) -> Result<Chunk, CompileError> {
         self.loop_contexts.clear();
-        self.function_context = None;
+        self.function_contexts.clear();
         let result = self.compile_program(program);
         self.loop_contexts.clear();
-        self.function_context = None;
+        self.function_contexts.clear();
         result
     }
 
@@ -266,8 +295,8 @@ impl Compiler {
         span: Span,
     ) -> Result<(), CompileError> {
         if self
-            .function_context
-            .as_ref()
+            .function_contexts
+            .last()
             .is_some_and(|context| context.block_depth > 0)
         {
             return Err(CompileError::BlockLocalUnsupported {
@@ -282,17 +311,8 @@ impl Compiler {
             chunk.write_instruction(OpCode::Null, span);
         }
 
-        if let Some(context) = self.function_context.as_mut() {
-            let slot = LocalSlot::try_from(context.next_slot).map_err(|_| {
-                CompileError::TooManyLocals {
-                    function: context.name.clone(),
-                    count: context.next_slot + 1,
-                    maximum: LocalSlot::MAX.as_usize() + 1,
-                    span,
-                }
-            })?;
-            context.next_slot += 1;
-            context.locals.insert(name.to_owned(), slot);
+        if !self.function_contexts.is_empty() {
+            self.declare_local(name, span)?;
             return Ok(());
         }
 
@@ -309,8 +329,14 @@ impl Compiler {
         body: &[Stmt],
         span: Span,
     ) -> Result<(), CompileError> {
-        if self.function_context.is_some() {
-            return Err(CompileError::NestedFunctionUnsupported {
+        let nested = !self.function_contexts.is_empty();
+        if nested
+            && self
+                .function_contexts
+                .last()
+                .is_some_and(|context| context.block_depth > 0)
+        {
+            return Err(CompileError::BlockLocalUnsupported {
                 name: name.to_owned(),
                 span,
             });
@@ -330,9 +356,18 @@ impl Compiler {
         }
 
         let saved_loops = std::mem::take(&mut self.loop_contexts);
-        self.function_context = Some(FunctionContext {
+        self.function_contexts.push(FunctionContext {
             name: name.to_owned(),
+            nested,
             locals,
+            nested_function_names: body
+                .iter()
+                .filter_map(|statement| match statement {
+                    Stmt::FnDecl { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect(),
+            upvalues: Vec::new(),
             next_slot: params.len(),
             block_depth: 0,
         });
@@ -349,16 +384,45 @@ impl Compiler {
             Ok(())
         })();
 
-        self.function_context = None;
+        let context = self
+            .function_contexts
+            .pop()
+            .expect("function compilation pushes a compiler context");
         self.loop_contexts = saved_loops;
         result?;
 
-        let function = Value::Function(Rc::new(Function::new(name, arity, function_chunk)));
+        let function = Value::Function(Rc::new(Function::with_upvalues(
+            name,
+            arity,
+            function_chunk,
+            context.upvalues,
+        )));
         let function = Self::add_constant(chunk, function, span)?;
-        chunk.write_instruction(OpCode::Constant(function), span);
-        let global_name = Self::add_constant(chunk, Value::String(name.to_owned()), span)?;
-        chunk.write_instruction(OpCode::DefineGlobal(global_name), span);
+        chunk.write_instruction(OpCode::Closure(function), span);
+        if nested {
+            self.declare_local(name, span)?;
+        } else {
+            let global_name = Self::add_constant(chunk, Value::String(name.to_owned()), span)?;
+            chunk.write_instruction(OpCode::DefineGlobal(global_name), span);
+        }
         Ok(())
+    }
+
+    fn declare_local(&mut self, name: &str, span: Span) -> Result<LocalSlot, CompileError> {
+        let context = self
+            .function_contexts
+            .last_mut()
+            .expect("local declarations require a function compiler context");
+        let slot =
+            LocalSlot::try_from(context.next_slot).map_err(|_| CompileError::TooManyLocals {
+                function: context.name.clone(),
+                count: context.next_slot + 1,
+                maximum: LocalSlot::MAX.as_usize() + 1,
+                span,
+            })?;
+        context.next_slot += 1;
+        context.locals.insert(name.to_owned(), slot);
+        Ok(slot)
     }
 
     fn compile_return(
@@ -367,7 +431,7 @@ impl Compiler {
         value: Option<&Expr>,
         span: Span,
     ) -> Result<(), CompileError> {
-        if self.function_context.is_none() {
+        if self.function_contexts.is_empty() {
             return Err(CompileError::ReturnOutsideFunction { span });
         }
         if let Some(value) = value {
@@ -484,11 +548,11 @@ impl Compiler {
         chunk: &mut Chunk,
         statements: &[Stmt],
     ) -> Result<(), CompileError> {
-        if let Some(context) = self.function_context.as_mut() {
+        if let Some(context) = self.function_contexts.last_mut() {
             context.block_depth += 1;
         }
         let result = self.compile_statements(chunk, statements);
-        if let Some(context) = self.function_context.as_mut() {
+        if let Some(context) = self.function_contexts.last_mut() {
             context.block_depth -= 1;
         }
         result
@@ -564,13 +628,7 @@ impl Compiler {
         match expression {
             Expr::Literal(literal) => Self::compile_literal(chunk, literal, fallback_span),
             Expr::Identifier(name) => {
-                if let Some(slot) = self.resolve_local(name) {
-                    chunk.write_instruction(OpCode::GetLocal(slot), fallback_span);
-                } else {
-                    let name =
-                        Self::add_constant(chunk, Value::String(name.clone()), fallback_span)?;
-                    chunk.write_instruction(OpCode::GetGlobal(name), fallback_span);
-                }
+                self.emit_get_variable(chunk, name, fallback_span)?;
                 Ok(())
             }
             Expr::Unary { op, expr } => {
@@ -600,12 +658,18 @@ impl Compiler {
             }
             Expr::Assign { name, value } => {
                 self.compile_expression(chunk, value, fallback_span)?;
-                if let Some(slot) = self.resolve_local(name) {
-                    chunk.write_instruction(OpCode::SetLocal(slot), fallback_span);
-                } else {
-                    let name =
-                        Self::add_constant(chunk, Value::String(name.clone()), fallback_span)?;
-                    chunk.write_instruction(OpCode::SetGlobal(name), fallback_span);
+                match self.resolve_variable(name, fallback_span)? {
+                    ResolvedVariable::Local(slot) => {
+                        chunk.write_instruction(OpCode::SetLocal(slot), fallback_span);
+                    }
+                    ResolvedVariable::Upvalue(index) => {
+                        chunk.write_instruction(OpCode::SetUpvalue(index), fallback_span);
+                    }
+                    ResolvedVariable::Global => {
+                        let name =
+                            Self::add_constant(chunk, Value::String(name.clone()), fallback_span)?;
+                        chunk.write_instruction(OpCode::SetGlobal(name), fallback_span);
+                    }
                 }
                 Ok(())
             }
@@ -633,9 +697,7 @@ impl Compiler {
                         maximum: Arity::MAX.as_usize(),
                         span: fallback_span,
                     })?;
-                let callee =
-                    Self::add_constant(chunk, Value::String(callee.clone()), fallback_span)?;
-                chunk.write_instruction(OpCode::GetGlobal(callee), fallback_span);
+                self.emit_get_variable(chunk, callee, fallback_span)?;
                 for argument in args {
                     self.compile_expression(chunk, argument, fallback_span)?;
                 }
@@ -676,10 +738,116 @@ impl Compiler {
         Self::patch_jump(chunk, end_jump, chunk.instructions().len(), span)
     }
 
-    fn resolve_local(&self, name: &str) -> Option<LocalSlot> {
-        self.function_context
-            .as_ref()
-            .and_then(|context| context.locals.get(name).copied())
+    fn emit_get_variable(
+        &mut self,
+        chunk: &mut Chunk,
+        name: &str,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        match self.resolve_variable(name, span)? {
+            ResolvedVariable::Local(slot) => {
+                chunk.write_instruction(OpCode::GetLocal(slot), span);
+            }
+            ResolvedVariable::Upvalue(index) => {
+                chunk.write_instruction(OpCode::GetUpvalue(index), span);
+            }
+            ResolvedVariable::Global => {
+                let name = Self::add_constant(chunk, Value::String(name.to_owned()), span)?;
+                chunk.write_instruction(OpCode::GetGlobal(name), span);
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_variable(
+        &mut self,
+        name: &str,
+        span: Span,
+    ) -> Result<ResolvedVariable, CompileError> {
+        let Some(current) = self.function_contexts.len().checked_sub(1) else {
+            return Ok(ResolvedVariable::Global);
+        };
+        if let Some(slot) = self.function_contexts[current].locals.get(name).copied() {
+            return Ok(ResolvedVariable::Local(slot));
+        }
+        if self.function_contexts[current].nested && self.function_contexts[current].name == name {
+            return Err(CompileError::NestedFunctionRecursionUnsupported {
+                name: name.to_owned(),
+                span,
+            });
+        }
+        if let Some(index) = self.resolve_upvalue(current, name, span)? {
+            return Ok(ResolvedVariable::Upvalue(index));
+        }
+        if self
+            .function_contexts
+            .iter()
+            .any(|context| context.nested_function_names.contains(name))
+        {
+            return Err(CompileError::NestedFunctionRecursionUnsupported {
+                name: name.to_owned(),
+                span,
+            });
+        }
+        Ok(ResolvedVariable::Global)
+    }
+
+    fn resolve_upvalue(
+        &mut self,
+        context_index: usize,
+        name: &str,
+        span: Span,
+    ) -> Result<Option<UpvalueIndex>, CompileError> {
+        let Some(enclosing_index) = context_index.checked_sub(1) else {
+            return Ok(None);
+        };
+        if let Some(slot) = self.function_contexts[enclosing_index]
+            .locals
+            .get(name)
+            .copied()
+        {
+            return self
+                .add_upvalue(context_index, UpvalueDescriptor::Local(slot), span)
+                .map(Some);
+        }
+        let Some(enclosing_upvalue) = self.resolve_upvalue(enclosing_index, name, span)? else {
+            return Ok(None);
+        };
+        self.add_upvalue(
+            context_index,
+            UpvalueDescriptor::Upvalue(enclosing_upvalue),
+            span,
+        )
+        .map(Some)
+    }
+
+    fn add_upvalue(
+        &mut self,
+        context_index: usize,
+        descriptor: UpvalueDescriptor,
+        span: Span,
+    ) -> Result<UpvalueIndex, CompileError> {
+        let context = &mut self.function_contexts[context_index];
+        if let Some(index) = context
+            .upvalues
+            .iter()
+            .position(|candidate| *candidate == descriptor)
+        {
+            return Ok(UpvalueIndex::try_from(index)
+                .expect("registered upvalue indexes are bounded before insertion"));
+        }
+        if context.upvalues.len() >= MAX_UPVALUES {
+            return Err(CompileError::TooManyUpvalues {
+                function: context.name.clone(),
+                count: context.upvalues.len() + 1,
+                maximum: MAX_UPVALUES,
+                span,
+            });
+        }
+        let index = UpvalueIndex::try_from(context.upvalues.len())
+            .expect("the configured upvalue limit fits in UpvalueIndex");
+        context.upvalues.push(descriptor);
+        Ok(index)
     }
 
     fn compile_literal(
@@ -769,8 +937,8 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
     use crate::vm::{
-        disassemble_chunk, Arity, Chunk, Function, JumpOffset, LocalSlot, OpCode, Value, Vm,
-        VmError, MAX_CALL_FRAMES,
+        disassemble_chunk, Arity, Chunk, Function, JumpOffset, LocalSlot, OpCode,
+        UpvalueDescriptor, UpvalueIndex, Value, Vm, VmError, MAX_CALL_FRAMES,
     };
 
     fn parse_source(source: &str) -> crate::ast::Program {
@@ -800,6 +968,20 @@ mod tests {
             .find_map(|value| match value {
                 Value::Function(function) if function.name() == name => {
                     Some(std::rc::Rc::clone(function))
+                }
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn nested_function(function: &Function, name: &str) -> std::rc::Rc<Function> {
+        function
+            .chunk()
+            .constants()
+            .iter()
+            .find_map(|value| match value {
+                Value::Function(nested) if nested.name() == name => {
+                    Some(std::rc::Rc::clone(nested))
                 }
                 _ => None,
             })
@@ -2056,13 +2238,365 @@ mod tests {
     }
 
     #[test]
-    fn nested_function_declaration_is_compile_error() {
+    fn nested_function_declaration_compiles() {
+        let source = concat!(
+            "fn outer() { fn inner() { return 1; } return inner; } ",
+            "let callable = outer(); let result = callable();"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(1));
+    }
+
+    #[test]
+    fn top_level_function_is_runtime_closure_without_captures() {
+        let chunk = compile_source("fn answer() { return 42; }").unwrap();
+        let mut vm = Vm::new();
+        assert_eq!(vm.run(&chunk), Ok(Value::Null));
+
+        assert!(matches!(
+            read_global(&mut vm, "answer"),
+            Value::Closure(closure) if closure.upvalue_count() == 0
+        ));
+    }
+
+    #[test]
+    fn nested_closure_captures_single_local() {
+        let source = concat!(
+            "fn outer() { let x = 42; fn inner() { return x; } return inner; } ",
+            "let callable = outer(); let result = callable();"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn nested_closure_captures_multiple_locals() {
+        let source = concat!(
+            "fn outer() { let x = 20; let y = 22; ",
+            "fn inner() { return x + y; } return inner; } ",
+            "let callable = outer(); let result = callable();"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn nested_closure_captures_parameter() {
+        let source = concat!(
+            "fn outer(value) { fn inner() { return value; } return inner; } ",
+            "let callable = outer(42); let result = callable();"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn returned_nested_function_remains_callable() {
+        let source = concat!(
+            "fn outer() { fn inner(value) { return value + 1; } return inner; } ",
+            "let callable = outer(); let result = callable(41);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn get_upvalue_reads_open_capture() {
+        let source = concat!(
+            "fn outer() { let x = 42; fn inner() { return x; } return inner(); } ",
+            "let result = outer();"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn get_upvalue_reads_closed_capture() {
+        let source = concat!(
+            "fn outer() { let x = 42; fn inner() { return x; } return inner; } ",
+            "let callable = outer(); let result = callable();"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn set_upvalue_updates_open_capture() {
+        let source = concat!(
+            "fn outer() { let x = 0; fn increment() { x = x + 1; return x; } ",
+            "increment(); return x; } let result = outer();"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(1));
+    }
+
+    #[test]
+    fn set_upvalue_updates_closed_capture() {
+        let source = concat!(
+            "fn make_counter() { let count = 0; fn next() { ",
+            "count = count + 1; return count; } return next; } ",
+            "let counter = make_counter(); counter(); let result = counter();"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(2));
+    }
+
+    #[test]
+    fn mutable_counter_closure_retains_state() {
+        let source = concat!(
+            "fn make_counter() { let count = 0; fn next() { ",
+            "count = count + 1; return count; } return next; } ",
+            "let counter = make_counter(); let a = counter(); ",
+            "let b = counter(); let c = counter();"
+        );
+
+        assert_eq!(run_source_and_get(source, "a"), Value::Int(1));
+        assert_eq!(run_source_and_get(source, "b"), Value::Int(2));
+        assert_eq!(run_source_and_get(source, "c"), Value::Int(3));
+    }
+
+    #[test]
+    fn captured_value_survives_parent_return_and_stack_truncation() {
+        let source = concat!(
+            "fn outer() { let value = \"survived\"; ",
+            "fn inner() { return value; } return inner; } ",
+            "let callable = outer(); let result = callable();"
+        );
+
         assert_eq!(
-            compile_source("fn outer() { fn inner() { return 1; } return 2; }"),
-            Err(CompileError::NestedFunctionUnsupported {
-                name: "inner".to_owned(),
-                span: Span::new(1, 14),
+            run_source_and_get(source, "result"),
+            Value::String("survived".to_owned())
+        );
+    }
+
+    #[test]
+    fn vm_remains_reusable_with_persistent_closure_global() {
+        let setup = compile_source(concat!(
+            "fn make_counter() { let count = 0; fn next() { ",
+            "count = count + 1; return count; } return next; } ",
+            "let counter = make_counter();"
+        ))
+        .unwrap();
+        let first = compile_source("let first = counter();").unwrap();
+        let second = compile_source("let second = counter();").unwrap();
+        let mut vm = Vm::new();
+
+        assert_eq!(vm.run(&setup), Ok(Value::Null));
+        assert_eq!(vm.run(&first), Ok(Value::Null));
+        assert_eq!(vm.run(&second), Ok(Value::Null));
+        assert_eq!(read_global(&mut vm, "first"), Value::Int(1));
+        assert_eq!(read_global(&mut vm, "second"), Value::Int(2));
+    }
+
+    #[test]
+    fn sibling_closures_share_one_open_then_closed_upvalue() {
+        let source = concat!(
+            "fn outer() { let x = 0; ",
+            "fn increment() { x = x + 1; return x; } ",
+            "fn get() { return x; } increment(); return get; } ",
+            "let getter = outer(); let result = getter();"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(1));
+    }
+
+    #[test]
+    fn separate_factory_calls_have_independent_upvalues() {
+        let source = concat!(
+            "fn make_counter() { let count = 0; fn next() { ",
+            "count = count + 1; return count; } return next; } ",
+            "let a = make_counter(); let b = make_counter(); ",
+            "let a1 = a(); let a2 = a(); let b1 = b();"
+        );
+
+        assert_eq!(run_source_and_get(source, "a2"), Value::Int(2));
+        assert_eq!(run_source_and_get(source, "b1"), Value::Int(1));
+    }
+
+    #[test]
+    fn grandchild_captures_grandparent_local() {
+        let source = concat!(
+            "fn outer() { let x = 42; fn middle() { ",
+            "fn inner() { return x; } return inner; } return middle; } ",
+            "let middle = outer(); let inner = middle(); let result = inner();"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn grandchild_reuses_parent_upvalue_descriptor() {
+        let outer = compiled_function(
+            "fn outer() { let x = 1; fn middle() { fn inner() { return x; } return inner; } return middle; }",
+            "outer",
+        );
+        let middle = nested_function(&outer, "middle");
+        let inner = nested_function(&middle, "inner");
+
+        assert_eq!(
+            middle.upvalues(),
+            &[UpvalueDescriptor::Local(LocalSlot::new(0))]
+        );
+        assert_eq!(
+            inner.upvalues(),
+            &[UpvalueDescriptor::Upvalue(UpvalueIndex::new(0))]
+        );
+    }
+
+    #[test]
+    fn multi_level_mutable_capture_updates_shared_storage() {
+        let source = concat!(
+            "fn outer() { let x = 0; fn middle() { fn inner() { ",
+            "x = x + 1; return x; } return inner; } return middle; } ",
+            "let middle = outer(); let inner = middle(); ",
+            "let first = inner(); let result = inner();"
+        );
+
+        assert_eq!(run_source_and_get(source, "first"), Value::Int(1));
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(2));
+    }
+
+    #[test]
+    fn closure_accepts_arguments_and_uses_local_variables() {
+        let source = concat!(
+            "fn make_adder(base) { fn add(value) { let result = base + value; ",
+            "return result; } return add; } let add_two = make_adder(2); ",
+            "let result = add_two(40);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn closure_can_call_global_function() {
+        let source = concat!(
+            "fn double(value) { return value * 2; } ",
+            "fn outer() { fn inner(value) { return double(value); } return inner; } ",
+            "let callable = outer(); let result = callable(21);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn global_function_can_call_closure_parameter() {
+        let source = concat!(
+            "fn apply(callable, value) { return callable(value); } ",
+            "fn make_adder(base) { fn add(value) { return base + value; } return add; } ",
+            "let add_two = make_adder(2); let result = apply(add_two, 40);"
+        );
+
+        assert_eq!(run_source_and_get(source, "result"), Value::Int(42));
+    }
+
+    #[test]
+    fn nested_function_binds_to_local_slot() {
+        let outer = compiled_function(
+            "fn outer() { fn inner() { return 1; } return inner; }",
+            "outer",
+        );
+
+        assert!(outer
+            .chunk()
+            .instructions()
+            .iter()
+            .any(|instruction| { instruction.opcode() == OpCode::GetLocal(LocalSlot::new(0)) }));
+        assert!(!outer
+            .chunk()
+            .instructions()
+            .iter()
+            .any(|instruction| { matches!(instruction.opcode(), OpCode::DefineGlobal(_)) }));
+    }
+
+    #[test]
+    fn captured_identifier_compiles_to_get_upvalue() {
+        let outer = compiled_function(
+            "fn outer() { let x = 1; fn inner() { return x; } return inner; }",
+            "outer",
+        );
+        let inner = nested_function(&outer, "inner");
+
+        assert_eq!(
+            inner.upvalues(),
+            &[UpvalueDescriptor::Local(LocalSlot::new(0))]
+        );
+        assert_eq!(
+            inner.chunk().instruction(0).unwrap().opcode(),
+            OpCode::GetUpvalue(UpvalueIndex::new(0))
+        );
+    }
+
+    #[test]
+    fn unresolved_nested_identifier_falls_back_to_global() {
+        let outer = compiled_function(
+            "fn outer() { fn inner() { return global_value; } return inner; }",
+            "outer",
+        );
+        let inner = nested_function(&outer, "inner");
+
+        assert!(inner.upvalues().is_empty());
+        assert!(matches!(
+            inner.chunk().instruction(0).unwrap().opcode(),
+            OpCode::GetGlobal(_)
+        ));
+    }
+
+    #[test]
+    fn self_recursive_nested_function_is_explicit_compile_error() {
+        assert!(matches!(
+            compile_source("fn outer() { fn inner(n) { return inner(n - 1); } return inner; }"),
+            Err(CompileError::NestedFunctionRecursionUnsupported { name, .. }) if name == "inner"
+        ));
+    }
+
+    #[test]
+    fn forward_recursive_nested_function_reference_is_explicit_error() {
+        let source = concat!(
+            "fn outer() { fn first() { return second(); } ",
+            "fn second() { return first(); } return first; }"
+        );
+
+        assert!(matches!(
+            compile_source(source),
+            Err(CompileError::NestedFunctionRecursionUnsupported { name, .. }) if name == "second"
+        ));
+    }
+
+    #[test]
+    fn too_many_upvalues_is_compile_error() {
+        let declarations = (0..=u8::MAX)
+            .map(|index| format!("let v{index} = {index};"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let captured = (0..=u8::MAX)
+            .map(|index| format!("v{index}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let source = format!(
+            "fn outer() {{ {declarations} fn inner() {{ return {captured}; }} return inner; }}"
+        );
+
+        assert!(matches!(
+            compile_source(&source),
+            Err(CompileError::TooManyUpvalues {
+                count: 256,
+                maximum: 255,
+                ..
             })
+        ));
+    }
+
+    #[test]
+    fn vm_matches_interpreter_for_closure_behavior() {
+        let source = concat!(
+            "fn make_counter() { let count = 0; fn next() { ",
+            "count = count + 1; return count; } return next; } ",
+            "let counter = make_counter(); counter(); let result = counter();"
+        );
+
+        assert_eq!(
+            run_source_and_get(source, "result").to_string(),
+            interpreter_global(source, "result")
         );
     }
 

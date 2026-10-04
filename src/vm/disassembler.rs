@@ -7,7 +7,10 @@ use std::fmt;
 use std::fmt::Write;
 
 use super::opcode::{resolve_jump_target, JumpDirection};
-use super::{Arity, Chunk, ConstantIndex, JumpOffset, LocalSlot, OpCode, Value};
+use super::{
+    Arity, Chunk, ConstantIndex, JumpOffset, LocalSlot, OpCode, UpvalueDescriptor, UpvalueIndex,
+    Value,
+};
 
 /// An error found while disassembling a bytecode chunk.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +25,10 @@ pub enum DisassembleError {
         constant_count: usize,
     },
     InvalidGlobalName {
+        offset: usize,
+        index: u32,
+    },
+    InvalidClosureFunction {
         offset: usize,
         index: u32,
     },
@@ -54,6 +61,10 @@ impl fmt::Display for DisassembleError {
             Self::InvalidGlobalName { offset, index } => write!(
                 f,
                 "instruction {offset} references constant index {index} as a global name, but it is not a string"
+            ),
+            Self::InvalidClosureFunction { offset, index } => write!(
+                f,
+                "instruction {offset} references constant index {index} as a closure function, but it is not a function"
             ),
             Self::InvalidJumpTarget {
                 offset,
@@ -112,6 +123,11 @@ pub fn disassemble_instruction(chunk: &Chunk, offset: usize) -> Result<String, D
         OpCode::GetLocal(slot) | OpCode::SetLocal(slot) => {
             Ok(format_local_instruction(offset, &span, name, slot))
         }
+        OpCode::Closure(index) => format_closure_instruction(chunk, offset, &span, name, index),
+        OpCode::GetUpvalue(index) | OpCode::SetUpvalue(index) => {
+            Ok(format_upvalue_instruction(offset, &span, name, index))
+        }
+        OpCode::CloseUpvalue(slot) => Ok(format_local_instruction(offset, &span, name, slot)),
         OpCode::Call(arity) => Ok(format_arity_instruction(offset, &span, name, arity)),
         OpCode::Jump(jump_offset) | OpCode::JumpIfFalse(jump_offset) => format_jump_instruction(
             chunk,
@@ -141,6 +157,55 @@ fn format_local_instruction(offset: usize, span: &str, name: &str, slot: LocalSl
 
 fn format_arity_instruction(offset: usize, span: &str, name: &str, arity: Arity) -> String {
     format!("{offset:04}  {span:<6} {name:<14} {}", arity.as_u8())
+}
+
+fn format_upvalue_instruction(
+    offset: usize,
+    span: &str,
+    name: &str,
+    index: UpvalueIndex,
+) -> String {
+    format!("{offset:04}  {span:<6} {name:<14} {}", index.as_u8())
+}
+
+fn format_closure_instruction(
+    chunk: &Chunk,
+    offset: usize,
+    span: &str,
+    name: &str,
+    index: ConstantIndex,
+) -> Result<String, DisassembleError> {
+    let value = chunk
+        .constant(index)
+        .ok_or(DisassembleError::InvalidConstantIndex {
+            offset,
+            index: index.as_u32(),
+            constant_count: chunk.constants().len(),
+        })?;
+    let Value::Function(function) = value else {
+        return Err(DisassembleError::InvalidClosureFunction {
+            offset,
+            index: index.as_u32(),
+        });
+    };
+    let mut output = format!(
+        "{offset:04}  {span:<6} {name:<14} {:<4} {}",
+        index.as_u32(),
+        value
+    );
+    for descriptor in function.upvalues() {
+        match descriptor {
+            UpvalueDescriptor::Local(slot) => {
+                write!(output, "\n               local {}", slot.as_u16())
+                    .expect("writing to a String cannot fail");
+            }
+            UpvalueDescriptor::Upvalue(index) => {
+                write!(output, "\n               upvalue {}", index.as_u8())
+                    .expect("writing to a String cannot fail");
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn format_jump_instruction(
@@ -223,6 +288,10 @@ fn opcode_name(opcode: OpCode) -> &'static str {
         OpCode::Jump(_) => "JUMP",
         OpCode::JumpIfFalse(_) => "JUMP_IF_FALSE",
         OpCode::Loop(_) => "LOOP",
+        OpCode::Closure(_) => "CLOSURE",
+        OpCode::GetUpvalue(_) => "GET_UPVALUE",
+        OpCode::SetUpvalue(_) => "SET_UPVALUE",
+        OpCode::CloseUpvalue(_) => "CLOSE_UPVALUE",
         OpCode::Call(_) => "CALL",
         OpCode::Return => "RETURN",
     }
@@ -244,7 +313,10 @@ mod tests {
 
     use super::{disassemble_chunk, disassemble_instruction, DisassembleError};
     use crate::error::Span;
-    use crate::vm::{Arity, Chunk, ConstantIndex, Function, JumpOffset, LocalSlot, OpCode, Value};
+    use crate::vm::{
+        Arity, Chunk, ConstantIndex, Function, JumpOffset, LocalSlot, OpCode, UpvalueDescriptor,
+        UpvalueIndex, Value,
+    };
 
     fn chunk_with(opcodes: &[OpCode]) -> Chunk {
         let mut chunk = Chunk::new();
@@ -319,6 +391,74 @@ mod tests {
         assert_eq!(
             disassemble_instruction(&chunk, 0).unwrap(),
             "0000  1:1    CALL           2"
+        );
+    }
+
+    #[test]
+    fn disassembles_closure_with_deterministic_capture_metadata() {
+        let mut chunk = Chunk::new();
+        let function = Function::with_upvalues(
+            "inner",
+            Arity::new(0),
+            Chunk::new(),
+            vec![
+                UpvalueDescriptor::Local(LocalSlot::new(2)),
+                UpvalueDescriptor::Upvalue(UpvalueIndex::new(1)),
+            ],
+        );
+        let index = chunk
+            .add_constant(Value::Function(Rc::new(function)))
+            .unwrap();
+        chunk.write_instruction(OpCode::Closure(index), Span::new(4, 5));
+
+        let expected = concat!(
+            "0000  4:5    CLOSURE        0    <fn inner>\n",
+            "               local 2\n",
+            "               upvalue 1"
+        );
+        assert_eq!(disassemble_instruction(&chunk, 0).unwrap(), expected);
+        assert_eq!(disassemble_instruction(&chunk, 0).unwrap(), expected);
+    }
+
+    #[test]
+    fn disassembles_get_and_set_upvalue() {
+        let chunk = chunk_with(&[
+            OpCode::GetUpvalue(UpvalueIndex::new(1)),
+            OpCode::SetUpvalue(UpvalueIndex::new(2)),
+        ]);
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0).unwrap(),
+            "0000  1:1    GET_UPVALUE    1"
+        );
+        assert_eq!(
+            disassemble_instruction(&chunk, 1).unwrap(),
+            "0001  1:2    SET_UPVALUE    2"
+        );
+    }
+
+    #[test]
+    fn disassembles_close_upvalue() {
+        let chunk = chunk_with(&[OpCode::CloseUpvalue(LocalSlot::new(3))]);
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0).unwrap(),
+            "0000  1:1    CLOSE_UPVALUE  3"
+        );
+    }
+
+    #[test]
+    fn rejects_non_function_closure_constant() {
+        let mut chunk = Chunk::new();
+        let index = chunk.add_constant(Value::Int(42)).unwrap();
+        chunk.write_instruction(OpCode::Closure(index), Span::new(1, 1));
+
+        assert_eq!(
+            disassemble_instruction(&chunk, 0),
+            Err(DisassembleError::InvalidClosureFunction {
+                offset: 0,
+                index: 0,
+            })
         );
     }
 

@@ -1,6 +1,15 @@
 use std::fmt;
 
-use super::{Arity, Chunk};
+use super::{Arity, Chunk, LocalSlot, UpvalueIndex};
+
+/// Describes how a closure captures one value from its enclosing closure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpvalueDescriptor {
+    /// Capture a frame-relative local from the immediately enclosing call.
+    Local(LocalSlot),
+    /// Reuse an upvalue already owned by the immediately enclosing closure.
+    Upvalue(UpvalueIndex),
+}
 
 /// A named Hanlin function compiled to its own bytecode chunk.
 ///
@@ -10,6 +19,7 @@ pub struct Function {
     name: String,
     arity: Arity,
     chunk: Chunk,
+    upvalues: Vec<UpvalueDescriptor>,
 }
 
 impl Function {
@@ -18,6 +28,21 @@ impl Function {
             name: name.into(),
             arity,
             chunk,
+            upvalues: Vec::new(),
+        }
+    }
+
+    pub fn with_upvalues(
+        name: impl Into<String>,
+        arity: Arity,
+        chunk: Chunk,
+        upvalues: Vec<UpvalueDescriptor>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            arity,
+            chunk,
+            upvalues,
         }
     }
 
@@ -32,6 +57,10 @@ impl Function {
     pub const fn chunk(&self) -> &Chunk {
         &self.chunk
     }
+
+    pub fn upvalues(&self) -> &[UpvalueDescriptor] {
+        &self.upvalues
+    }
 }
 
 impl fmt::Debug for Function {
@@ -39,6 +68,26 @@ impl fmt::Debug for Function {
         f.debug_struct("Function")
             .field("name", &self.name)
             .field("arity", &self.arity)
+            .field("upvalue_count", &self.upvalues.len())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Function, UpvalueDescriptor};
+    use crate::vm::{Arity, Chunk, LocalSlot, UpvalueIndex};
+
+    #[test]
+    fn function_keeps_deterministic_capture_metadata() {
+        let descriptors = vec![
+            UpvalueDescriptor::Local(LocalSlot::new(2)),
+            UpvalueDescriptor::Upvalue(UpvalueIndex::new(1)),
+        ];
+        let function =
+            Function::with_upvalues("inner", Arity::new(0), Chunk::new(), descriptors.clone());
+
+        assert_eq!(function.upvalues(), descriptors);
+        assert!(format!("{function:?}").contains("upvalue_count: 2"));
     }
 }

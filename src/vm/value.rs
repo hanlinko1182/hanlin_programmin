@@ -1,14 +1,14 @@
 use std::fmt;
 use std::rc::Rc;
 
-use super::Function;
+use super::{Closure, Function};
 
 /// A runtime value suitable for storage in VM bytecode constant pools.
 ///
 /// This type is intentionally separate from [`crate::interpreter::Value`].
 /// The tree-walking interpreter stores environments, functions, and shared
-/// mutable collections, while the VM will eventually use its own stack and
-/// object representation.
+/// mutable collections, while the VM uses compiled functions and closures with
+/// shared upvalue storage.
 #[derive(Clone, Debug)]
 pub enum Value {
     Null,
@@ -16,7 +16,10 @@ pub enum Value {
     Int(i64),
     Float(f64),
     String(String),
+    /// Immutable compiled code stored in constant pools.
     Function(Rc<Function>),
+    /// Callable runtime function paired with captured lexical state.
+    Closure(Rc<Closure>),
 }
 
 impl PartialEq for Value {
@@ -28,6 +31,7 @@ impl PartialEq for Value {
             (Self::Float(left), Self::Float(right)) => left == right,
             (Self::String(left), Self::String(right)) => left == right,
             (Self::Function(left), Self::Function(right)) => Rc::ptr_eq(left, right),
+            (Self::Closure(left), Self::Closure(right)) => Rc::ptr_eq(left, right),
             _ => false,
         }
     }
@@ -44,6 +48,7 @@ impl Value {
             Self::Float(value) => *value != 0.0 && !value.is_nan(),
             Self::String(value) => !value.is_empty(),
             Self::Function(_) => true,
+            Self::Closure(_) => true,
         }
     }
 }
@@ -57,6 +62,7 @@ impl fmt::Display for Value {
             Self::Float(value) => write!(f, "{value}"),
             Self::String(value) => write!(f, "{value}"),
             Self::Function(function) => write!(f, "<fn {}>", function.name()),
+            Self::Closure(closure) => write!(f, "<fn {}>", closure.function().name()),
         }
     }
 }
@@ -66,7 +72,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::Value;
-    use crate::vm::{Arity, Chunk, Function};
+    use crate::vm::{Arity, Chunk, Closure, Function};
 
     #[test]
     fn values_compare_by_type_and_contents() {
@@ -121,6 +127,20 @@ mod tests {
         let distinct = Value::Function(Rc::new(Function::new("add", Arity::new(2), Chunk::new())));
 
         assert_eq!(original.to_string(), "<fn add>");
+        assert_eq!(original, same);
+        assert_ne!(original, distinct);
+        assert!(original.is_truthy());
+    }
+
+    #[test]
+    fn closure_values_use_identity_equality_and_function_display() {
+        let function = Rc::new(Function::new("counter", Arity::new(0), Chunk::new()));
+        let closure = Rc::new(Closure::new(Rc::clone(&function)));
+        let original = Value::Closure(Rc::clone(&closure));
+        let same = Value::Closure(closure);
+        let distinct = Value::Closure(Rc::new(Closure::new(function)));
+
+        assert_eq!(original.to_string(), "<fn counter>");
         assert_eq!(original, same);
         assert_ne!(original, distinct);
         assert!(original.is_truthy());

@@ -1,10 +1,12 @@
 //! Execution engine for Hanlin bytecode.
 //!
 //! The VM executes manually constructed bytecode and chunks produced by the
-//! AST compiler, including named functions through iterative call frames.
+//! AST compiler, including named closures and shared lexical upvalues through
+//! iterative call frames.
 //! Integer arithmetic is checked and reports [`VmError::IntegerOverflow`]
 //! instead of depending on Rust's debug or release overflow behavior.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
@@ -12,8 +14,12 @@ use std::rc::Rc;
 
 use crate::error::Span;
 
+use super::closure::{Upvalue, UpvalueState};
 use super::opcode::{resolve_jump_target, JumpDirection};
-use super::{Arity, Chunk, Function, JumpOffset, LocalSlot, OpCode, Value};
+use super::{
+    Arity, Chunk, Closure, ConstantIndex, Function, JumpOffset, LocalSlot, OpCode,
+    UpvalueDescriptor, UpvalueIndex, Value,
+};
 
 /// Maximum number of active Hanlin function calls, excluding the script frame.
 pub const MAX_CALL_FRAMES: usize = 1024;
@@ -103,6 +109,37 @@ pub enum VmError {
     CallStackOverflow {
         instruction_offset: usize,
         limit: usize,
+        span: Span,
+    },
+    InvalidClosureFunction {
+        instruction_offset: usize,
+        index: u32,
+        value: Value,
+        span: Span,
+    },
+    InvalidUpvalue {
+        instruction_offset: usize,
+        opcode: OpCode,
+        index: UpvalueIndex,
+        upvalue_count: usize,
+        span: Span,
+    },
+    InvalidCaptureLocal {
+        instruction_offset: usize,
+        slot: LocalSlot,
+        stack_len: usize,
+        span: Span,
+    },
+    InvalidCaptureUpvalue {
+        instruction_offset: usize,
+        index: UpvalueIndex,
+        upvalue_count: usize,
+        span: Span,
+    },
+    InvalidOpenUpvalue {
+        instruction_offset: usize,
+        stack_index: usize,
+        stack_len: usize,
         span: Span,
     },
 }
@@ -264,6 +301,55 @@ impl fmt::Display for VmError {
                 f,
                 "call stack limit {limit} exceeded at instruction {instruction_offset} ({span})"
             ),
+            Self::InvalidClosureFunction {
+                instruction_offset,
+                index,
+                value,
+                span,
+            } => write!(
+                f,
+                "constant index {index} is not a compiled function for CLOSURE at instruction {instruction_offset} ({span}): {value:?}"
+            ),
+            Self::InvalidUpvalue {
+                instruction_offset,
+                opcode,
+                index,
+                upvalue_count,
+                span,
+            } => write!(
+                f,
+                "upvalue index {} is invalid for a closure with {upvalue_count} upvalues while executing {opcode:?} at instruction {instruction_offset} ({span})",
+                index.as_u8()
+            ),
+            Self::InvalidCaptureLocal {
+                instruction_offset,
+                slot,
+                stack_len,
+                span,
+            } => write!(
+                f,
+                "cannot capture local slot {} from a stack with {stack_len} values at instruction {instruction_offset} ({span})",
+                slot.as_u16()
+            ),
+            Self::InvalidCaptureUpvalue {
+                instruction_offset,
+                index,
+                upvalue_count,
+                span,
+            } => write!(
+                f,
+                "cannot capture enclosing upvalue {} from a closure with {upvalue_count} upvalues at instruction {instruction_offset} ({span})",
+                index.as_u8()
+            ),
+            Self::InvalidOpenUpvalue {
+                instruction_offset,
+                stack_index,
+                stack_len,
+                span,
+            } => write!(
+                f,
+                "open upvalue points to stack index {stack_index}, but the stack has {stack_len} values at instruction {instruction_offset} ({span})"
+            ),
         }
     }
 }
@@ -279,12 +365,13 @@ impl std::error::Error for VmError {}
 pub struct Vm {
     stack: Vec<Value>,
     frames: Vec<CallFrame>,
+    open_upvalues: Vec<Upvalue>,
     globals: HashMap<String, Value>,
 }
 
 #[derive(Debug)]
 struct CallFrame {
-    function: Rc<Function>,
+    closure: Rc<Closure>,
     instruction_pointer: usize,
     base: usize,
     last_span: Option<Span>,
@@ -295,6 +382,7 @@ impl Vm {
         Self {
             stack: Vec::new(),
             frames: Vec::new(),
+            open_upvalues: Vec::new(),
             globals: HashMap::new(),
         }
     }
@@ -306,9 +394,13 @@ impl Vm {
     /// success and failure, while global bindings persist.
     pub fn run(&mut self, chunk: &Chunk) -> Result<Value, VmError> {
         self.reset_execution_state();
-        let script = Rc::new(Function::new("<script>", Arity::new(0), chunk.clone()));
+        let script = Rc::new(Closure::new(Rc::new(Function::new(
+            "<script>",
+            Arity::new(0),
+            chunk.clone(),
+        ))));
         self.frames.push(CallFrame {
-            function: script,
+            closure: script,
             instruction_pointer: 0,
             base: 0,
             last_span: None,
@@ -320,27 +412,28 @@ impl Vm {
 
     fn execute(&mut self) -> Result<Value, VmError> {
         loop {
-            let (function, instruction_offset, instruction) = {
+            let (closure, instruction_offset, instruction) = {
                 let frame = self
                     .frames
                     .last_mut()
                     .expect("the script frame remains active until execution returns");
                 let instruction_offset = frame.instruction_pointer;
                 let instruction = frame
-                    .function
+                    .closure
+                    .function()
                     .chunk()
                     .instruction(instruction_offset)
                     .copied()
                     .ok_or(VmError::InstructionPointerOutOfBounds {
                         instruction_pointer: instruction_offset,
-                        instruction_count: frame.function.chunk().instructions().len(),
+                        instruction_count: frame.closure.function().chunk().instructions().len(),
                         last_span: frame.last_span,
                     })?;
                 frame.instruction_pointer += 1;
                 frame.last_span = Some(instruction.span());
-                (Rc::clone(&frame.function), instruction_offset, instruction)
+                (Rc::clone(&frame.closure), instruction_offset, instruction)
             };
-            let chunk = function.chunk();
+            let chunk = closure.function().chunk();
             let span = instruction.span();
 
             match instruction.opcode() {
@@ -422,6 +515,18 @@ impl Vm {
                         span,
                     )?;
                 }
+                OpCode::Closure(index) => {
+                    self.execute_closure(chunk, index, instruction_offset, span)?;
+                }
+                OpCode::GetUpvalue(index) => {
+                    self.get_upvalue(index, instruction_offset, span)?;
+                }
+                OpCode::SetUpvalue(index) => {
+                    self.set_upvalue(index, instruction_offset, span)?;
+                }
+                OpCode::CloseUpvalue(slot) => {
+                    self.close_upvalue(slot, instruction_offset, span)?;
+                }
                 OpCode::Call(arity) => {
                     self.execute_call(arity, instruction_offset, span)?;
                 }
@@ -432,6 +537,212 @@ impl Vm {
                 }
             }
         }
+    }
+
+    fn execute_closure(
+        &mut self,
+        chunk: &Chunk,
+        index: ConstantIndex,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let value = chunk
+            .constant(index)
+            .cloned()
+            .ok_or(VmError::InvalidConstantReference {
+                instruction_offset,
+                index: index.as_u32(),
+                constant_count: chunk.constants().len(),
+                span,
+            })?;
+        let Value::Function(function) = value else {
+            return Err(VmError::InvalidClosureFunction {
+                instruction_offset,
+                index: index.as_u32(),
+                value,
+                span,
+            });
+        };
+
+        let (frame_base, enclosing) = {
+            let frame = self
+                .frames
+                .last()
+                .expect("closure construction requires an active frame");
+            (frame.base, Rc::clone(&frame.closure))
+        };
+        let mut upvalues = Vec::with_capacity(function.upvalues().len());
+        for descriptor in function.upvalues() {
+            let upvalue = match descriptor {
+                UpvalueDescriptor::Local(slot) => {
+                    let stack_index = frame_base
+                        .checked_add(slot.as_usize())
+                        .filter(|index| *index < self.stack.len());
+                    let Some(stack_index) = stack_index else {
+                        return Err(VmError::InvalidCaptureLocal {
+                            instruction_offset,
+                            slot: *slot,
+                            stack_len: self.stack.len(),
+                            span,
+                        });
+                    };
+                    self.capture_upvalue(stack_index)
+                }
+                UpvalueDescriptor::Upvalue(index) => enclosing
+                    .upvalue(index.as_usize())
+                    .cloned()
+                    .ok_or(VmError::InvalidCaptureUpvalue {
+                    instruction_offset,
+                    index: *index,
+                    upvalue_count: enclosing.upvalue_count(),
+                    span,
+                })?,
+            };
+            upvalues.push(upvalue);
+        }
+        self.stack
+            .push(Value::Closure(Rc::new(Closure::with_upvalues(
+                function, upvalues,
+            ))));
+        Ok(())
+    }
+
+    fn get_upvalue(
+        &mut self,
+        index: UpvalueIndex,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let upvalue =
+            self.current_upvalue(index, OpCode::GetUpvalue(index), instruction_offset, span)?;
+        let value = match &*upvalue.borrow() {
+            UpvalueState::Open(stack_index) => {
+                self.stack
+                    .get(*stack_index)
+                    .cloned()
+                    .ok_or(VmError::InvalidOpenUpvalue {
+                        instruction_offset,
+                        stack_index: *stack_index,
+                        stack_len: self.stack.len(),
+                        span,
+                    })?
+            }
+            UpvalueState::Closed(value) => value.clone(),
+        };
+        self.stack.push(value);
+        Ok(())
+    }
+
+    fn set_upvalue(
+        &mut self,
+        index: UpvalueIndex,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let value = self.stack.last().cloned().ok_or(VmError::StackUnderflow {
+            instruction_offset,
+            opcode: OpCode::SetUpvalue(index),
+            needed: 1,
+            available: 0,
+            span,
+        })?;
+        let upvalue =
+            self.current_upvalue(index, OpCode::SetUpvalue(index), instruction_offset, span)?;
+        let mut state = upvalue.borrow_mut();
+        match &mut *state {
+            UpvalueState::Open(stack_index) => {
+                let stack_len = self.stack.len();
+                let slot = self
+                    .stack
+                    .get_mut(*stack_index)
+                    .ok_or(VmError::InvalidOpenUpvalue {
+                        instruction_offset,
+                        stack_index: *stack_index,
+                        stack_len,
+                        span,
+                    })?;
+                *slot = value;
+            }
+            UpvalueState::Closed(closed) => *closed = value,
+        }
+        Ok(())
+    }
+
+    fn current_upvalue(
+        &self,
+        index: UpvalueIndex,
+        opcode: OpCode,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<Upvalue, VmError> {
+        let closure = &self
+            .frames
+            .last()
+            .expect("upvalue access requires an active frame")
+            .closure;
+        closure
+            .upvalue(index.as_usize())
+            .cloned()
+            .ok_or(VmError::InvalidUpvalue {
+                instruction_offset,
+                opcode,
+                index,
+                upvalue_count: closure.upvalue_count(),
+                span,
+            })
+    }
+
+    fn capture_upvalue(&mut self, stack_index: usize) -> Upvalue {
+        if let Some(upvalue) = self.open_upvalues.iter().find(|upvalue| {
+            matches!(*upvalue.borrow(), UpvalueState::Open(index) if index == stack_index)
+        }) {
+            return Rc::clone(upvalue);
+        }
+        let upvalue = Rc::new(RefCell::new(UpvalueState::Open(stack_index)));
+        self.open_upvalues.push(Rc::clone(&upvalue));
+        upvalue
+    }
+
+    fn close_upvalue(
+        &mut self,
+        slot: LocalSlot,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<(), VmError> {
+        let base = self
+            .frames
+            .last()
+            .expect("upvalue closing requires an active frame")
+            .base;
+        let stack_index = base
+            .checked_add(slot.as_usize())
+            .filter(|index| *index < self.stack.len())
+            .ok_or(VmError::InvalidCaptureLocal {
+                instruction_offset,
+                slot,
+                stack_len: self.stack.len(),
+                span,
+            })?;
+        self.close_upvalues_matching(|index| index == stack_index);
+        Ok(())
+    }
+
+    fn close_upvalues_from(&mut self, first_stack_index: usize) {
+        self.close_upvalues_matching(|index| index >= first_stack_index);
+    }
+
+    fn close_upvalues_matching(&mut self, should_close: impl Fn(usize) -> bool) {
+        for upvalue in &self.open_upvalues {
+            let stack_index = match *upvalue.borrow() {
+                UpvalueState::Open(index) if should_close(index) => index,
+                _ => continue,
+            };
+            if let Some(value) = self.stack.get(stack_index).cloned() {
+                *upvalue.borrow_mut() = UpvalueState::Closed(value);
+            }
+        }
+        self.open_upvalues
+            .retain(|upvalue| matches!(*upvalue.borrow(), UpvalueState::Open(_)));
     }
 
     fn execute_call(
@@ -452,18 +763,18 @@ impl Vm {
         }
         let callee_index = self.stack.len() - needed;
         let callee = self.stack[callee_index].clone();
-        let Value::Function(function) = callee else {
+        let Value::Closure(closure) = callee else {
             return Err(VmError::NotCallable {
                 instruction_offset,
                 value: callee,
                 span,
             });
         };
-        if function.arity() != arity {
+        if closure.function().arity() != arity {
             return Err(VmError::ArityMismatch {
                 instruction_offset,
-                function: function.name().to_owned(),
-                expected: function.arity(),
+                function: closure.function().name().to_owned(),
+                expected: closure.function().arity(),
                 got: arity,
                 span,
             });
@@ -477,7 +788,7 @@ impl Vm {
             });
         }
         self.frames.push(CallFrame {
-            function,
+            closure,
             instruction_pointer: 0,
             base: callee_index + 1,
             last_span: None,
@@ -500,6 +811,7 @@ impl Vm {
             .base
             .checked_sub(1)
             .expect("function frame bases follow their callee");
+        self.close_upvalues_from(frame.base);
         self.stack.truncate(callee_index);
         self.stack.push(result);
         None
@@ -1032,8 +1344,10 @@ impl Vm {
     }
 
     fn reset_execution_state(&mut self) {
+        self.close_upvalues_from(0);
         self.stack.clear();
         self.frames.clear();
+        self.open_upvalues.clear();
     }
 
     fn current_frame_mut(&mut self) -> &mut CallFrame {
@@ -1051,9 +1365,14 @@ impl Default for Vm {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::{Vm, VmError};
     use crate::error::Span;
-    use crate::vm::{Chunk, ConstantIndex, JumpOffset, LocalSlot, OpCode, Value};
+    use crate::vm::{
+        Arity, Chunk, ConstantIndex, Function, JumpOffset, LocalSlot, OpCode, UpvalueDescriptor,
+        UpvalueIndex, Value,
+    };
 
     const SPAN: Span = Span { line: 1, col: 1 };
 
@@ -2435,7 +2754,8 @@ mod tests {
         let mut chunk = Chunk::new();
         chunk.write_instruction(OpCode::SetLocal(LocalSlot::MAX), SPAN);
 
-        let result = std::panic::catch_unwind(|| Vm::new().run(&chunk));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Vm::new().run(&chunk)));
         assert!(matches!(
             result,
             Ok(Err(VmError::InvalidLocalSlot {
@@ -2787,6 +3107,173 @@ mod tests {
     }
 
     #[test]
+    fn invalid_get_upvalue_is_structured_error() {
+        let chunk = return_chunk(OpCode::GetUpvalue(UpvalueIndex::new(0)));
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidUpvalue {
+                instruction_offset: 0,
+                opcode: OpCode::GetUpvalue(UpvalueIndex::new(0)),
+                index: UpvalueIndex::new(0),
+                upvalue_count: 0,
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_set_upvalue_is_structured_error() {
+        let mut chunk = Chunk::new();
+        let value = chunk.add_constant(Value::Int(1)).unwrap();
+        chunk.write_instruction(OpCode::Constant(value), SPAN);
+        chunk.write_instruction(OpCode::SetUpvalue(UpvalueIndex::new(0)), SPAN);
+
+        assert!(matches!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidUpvalue {
+                opcode: OpCode::SetUpvalue(_),
+                upvalue_count: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn closure_rejects_non_function_constant() {
+        let mut chunk = Chunk::new();
+        let value = chunk.add_constant(Value::Int(42)).unwrap();
+        chunk.write_instruction(OpCode::Closure(value), SPAN);
+
+        assert!(matches!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidClosureFunction {
+                index: 0,
+                value: Value::Int(42),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn closure_rejects_invalid_enclosing_local_capture() {
+        let mut chunk = Chunk::new();
+        let function = Function::with_upvalues(
+            "bad",
+            Arity::new(0),
+            Chunk::new(),
+            vec![UpvalueDescriptor::Local(LocalSlot::new(0))],
+        );
+        let function = chunk
+            .add_constant(Value::Function(Rc::new(function)))
+            .unwrap();
+        chunk.write_instruction(OpCode::Closure(function), SPAN);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidCaptureLocal {
+                instruction_offset: 0,
+                slot: LocalSlot::new(0),
+                stack_len: 0,
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn closure_rejects_invalid_enclosing_upvalue_capture() {
+        let mut chunk = Chunk::new();
+        let function = Function::with_upvalues(
+            "bad",
+            Arity::new(0),
+            Chunk::new(),
+            vec![UpvalueDescriptor::Upvalue(UpvalueIndex::new(0))],
+        );
+        let function = chunk
+            .add_constant(Value::Function(Rc::new(function)))
+            .unwrap();
+        chunk.write_instruction(OpCode::Closure(function), SPAN);
+
+        assert_eq!(
+            Vm::new().run(&chunk),
+            Err(VmError::InvalidCaptureUpvalue {
+                instruction_offset: 0,
+                index: UpvalueIndex::new(0),
+                upvalue_count: 0,
+                span: SPAN,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_closure_capture_does_not_panic() {
+        let mut chunk = Chunk::new();
+        let function = Function::with_upvalues(
+            "bad",
+            Arity::new(0),
+            Chunk::new(),
+            vec![UpvalueDescriptor::Local(LocalSlot::MAX)],
+        );
+        let function = chunk
+            .add_constant(Value::Function(Rc::new(function)))
+            .unwrap();
+        chunk.write_instruction(OpCode::Closure(function), SPAN);
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Vm::new().run(&chunk)));
+        assert!(matches!(
+            result,
+            Ok(Err(VmError::InvalidCaptureLocal {
+                slot: LocalSlot::MAX,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn close_upvalue_preserves_captured_value_after_run() {
+        let mut inner_chunk = Chunk::new();
+        inner_chunk.write_instruction(OpCode::GetUpvalue(UpvalueIndex::new(0)), SPAN);
+        inner_chunk.write_instruction(OpCode::Return, SPAN);
+        let inner = Function::with_upvalues(
+            "inner",
+            Arity::new(0),
+            inner_chunk,
+            vec![UpvalueDescriptor::Local(LocalSlot::new(0))],
+        );
+
+        let mut factory = Chunk::new();
+        let captured = factory.add_constant(Value::Int(42)).unwrap();
+        let inner = factory
+            .add_constant(Value::Function(Rc::new(inner)))
+            .unwrap();
+        factory.write_instruction(OpCode::Constant(captured), SPAN);
+        factory.write_instruction(OpCode::Closure(inner), SPAN);
+        factory.write_instruction(OpCode::CloseUpvalue(LocalSlot::new(0)), SPAN);
+        factory.write_instruction(OpCode::Return, SPAN);
+
+        let closure = Vm::new().run(&factory).unwrap();
+        let mut call = Chunk::new();
+        let closure = call.add_constant(closure).unwrap();
+        call.write_instruction(OpCode::Constant(closure), SPAN);
+        call.write_instruction(OpCode::Call(Arity::new(0)), SPAN);
+        call.write_instruction(OpCode::Return, SPAN);
+
+        assert_eq!(Vm::new().run(&call), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn vm_is_reusable_after_closure_runtime_error() {
+        let bad = return_chunk(OpCode::GetUpvalue(UpvalueIndex::new(0)));
+        let good = constant_chunk(Value::Int(42));
+        let mut vm = Vm::new();
+
+        assert!(matches!(vm.run(&bad), Err(VmError::InvalidUpvalue { .. })));
+        assert_eq!(vm.run(&good), Ok(Value::Int(42)));
+        assert!(vm.open_upvalues.is_empty());
+    }
+
+    #[test]
     fn state_resets_between_runs() {
         let mut first = Chunk::new();
         first.write_instruction(OpCode::True, SPAN);
@@ -2800,6 +3287,7 @@ mod tests {
         assert_eq!(vm.run(&second), Ok(Value::Null));
         assert!(vm.stack.is_empty());
         assert!(vm.frames.is_empty());
+        assert!(vm.open_upvalues.is_empty());
     }
 
     #[test]
