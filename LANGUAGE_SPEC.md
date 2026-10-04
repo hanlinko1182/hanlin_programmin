@@ -54,6 +54,10 @@ source.hl → Lexer → Parser → CEmitter → C source on stdout
 
 The `--emit-c` command emits C source. It does not automatically invoke GCC or create a native binary.
 
+The implementation includes foundational bytecode data structures for a future
+stack-based VM. They are not currently connected to source compilation or
+execution; the tree-walking interpreter remains the primary runtime.
+
 ## 3. Lexical Structure
 
 ### 3.1 Whitespace and statements

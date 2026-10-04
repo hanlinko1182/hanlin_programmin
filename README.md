@@ -34,6 +34,10 @@ cargo build --release
 
 The default mode lexes, parses, and executes the program with the tree-walking interpreter.
 
+The repository also contains an experimental bytecode representation foundation
+for a future stack-based VM. It is not yet a compiler or execution backend, and
+does not change the default interpreter or the C emitter.
+
 ### Debug and code-generation modes
 
 ```bash
@@ -171,7 +175,8 @@ src/
 ├── ast.rs           # AST definitions
 ├── interpreter.rs   # Tree-walking interpreter and built-ins
 ├── codegen.rs       # AST to C source emitter
-└── error.rs         # Error types and source spans
+├── error.rs         # Error types and source spans
+└── vm/              # Experimental bytecode representation (not an execution backend)
 
 examples/            # Demonstration programs
 tests/               # Integration and malformed-input tests
